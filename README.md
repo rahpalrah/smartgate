@@ -204,12 +204,12 @@ On 26,872 real-style support messages (Bitext dataset), with settings derived fr
 - **Adaptive routing raised answer quality during the run.**
 - **About 90% lower cost** than sending everything to Opus.
 
-Full method, numbers and limits: [docs/BENCHMARK.md](docs/BENCHMARK.md).
+Full method, numbers and limits: [docs/BENCHMARK.md](docs/BENCHMARK.md). A second benchmark on two Kaggle datasets (Quora Question Pairs and Customer Support on Twitter), including where the system is weak, is in [docs/KAGGLE_BENCHMARK.md](docs/KAGGLE_BENCHMARK.md).
 
 ## Testing
 
 ```bash
-pytest -q                                              # 135 tests, ~15 s, fully offline
+pytest -q                                              # 141 tests, ~15 s, fully offline
 SMARTGATE_FUZZ=3000 pytest tests/advanced/test_properties.py   # deeper fuzzing
 ```
 
@@ -245,7 +245,7 @@ smartgate/
   providers/        Provider base, AnthropicProvider, CallableProvider, MockProvider
   config.py         dict/JSON/YAML config + industry presets
   server.py client.py cli.py observability.py
-tests/              135 tests: unit, e2e, HTTP, property-based, concurrency, chaos, quality benchmarks
+tests/              141 tests: unit, e2e, HTTP, property-based, concurrency, chaos, quality benchmarks
 ```
 
 ## License

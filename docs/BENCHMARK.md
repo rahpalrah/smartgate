@@ -68,6 +68,7 @@ A simulated reviewer gave each answer thumbs-up when its reference similarity re
 | Savings vs always-Opus | 86% | 90% |
 
 ## Limits
+- **The live run's cache share is built into its design:** 35% of its traffic re-asks one of 40 hot questions. It is not a natural hit rate; see `docs/KAGGLE_BENCHMARK.md` for hit rates on open-ended real traffic, which are much lower.
 - **Reference similarity is an automatic proxy.** It rewards answers that resemble the human reply. It is no substitute for a human review sample or a strong LLM judge (`LLMJudgeValidator`) before production.
 - **The local 0.5B–3B models are much weaker than Claude.** These results show the gateway's mechanisms working; absolute answer quality on Claude models was not measured.
 - Shadow prices use list prices; cache-replay costs assume a 60-token reply.

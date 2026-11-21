@@ -313,9 +313,9 @@ def twitter_part(pairs, embedders, nomic, ref_embedder):
     baseline_sim = statistics.mean(sims)
     print(f"[twitter] random same-brand reply similarity baseline: {baseline_sim:.3f}", flush=True)
     plan = [("nomic-embed-text-v1.5", t, dict()) for t in (0.90, 0.94, 0.97, 0.98)] if "nomic-embed-text-v1.5" in embedders else []
-    plan += [("nomic-embed-text-v1.5", 0.90, GUARD_CONFIGS["no guards"])] if plan else []
+    plan += [("nomic-embed-text-v1.5", 0.90, GUARD_CONFIGS["no guards (legacy exact match)"])] if plan else []
     plan += [("hashing (built-in)", t, dict()) for t in (0.80, 0.86, 0.92)]
-    plan += [("hashing (built-in)", 0.86, GUARD_CONFIGS["no guards"])]
+    plan += [("hashing (built-in)", 0.86, GUARD_CONFIGS["no guards (legacy exact match)"])]
     # shared (global) cache: counts the cross-brand answers that tenant scoping prevents
     plan += [("hashing (built-in)", 0.86, {"scope": "global"})]
     plan += [("nomic-embed-text-v1.5", 0.94, {"scope": "global"})] if "nomic-embed-text-v1.5" in embedders else []
