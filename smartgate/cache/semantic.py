@@ -28,42 +28,75 @@ _NEG = re.compile(r"\b(not|no|never|none|nor|without|cannot|neither|nothing|nobo
                   r"isn|aren|wasn|weren|doesn|didn|won|wouldn|shouldn|couldn|can t|don)\b")
 
 # Action classes: words inside one class are synonyms; two classes are different requests.
+# "a ... b" matches a split phrase such as "set my address up".
 DEFAULT_ACTION_CLASSES: Dict[str, Sequence[str]] = {
     "cancel": ("cancel", "cancellation", "abort"),
-    "track": ("track", "tracking", "status", "where is", "wheres", "arrive", "eta"),
-    "modify": ("change", "modify", "edit", "update", "amend", "correct", "switch", "alter"),
+    "track": ("track", "status", "where is", "wheres", "arrive", "eta", "expect", "waiting for",
+              "wait for", "await", "still waiting", "when will"),
+    "modify": ("change", "modify", "edit", "update", "amend", "correct", "alter"),
+    "switch": ("switch", "change to", "upgrade", "downgrade", "move to", "use another", "swap"),
     "delete": ("delete", "remove", "close", "deactivate", "terminate", "erase"),
-    "create": ("create", "open", "register", "sign up", "signup", "set up", "setup", "new account"),
-    "obtain": ("get", "send", "download", "mail", "email me", "receive", "print"),
-    "inspect": ("check", "view", "see", "find", "locate", "look up", "lookup", "consult", "show"),
+    "create": ("create", "open", "register", "sign up", "signup", "set up", "setup", "set ... up",
+               "new account"),
+    "obtain": ("get", "send", "download", "mail", "email me", "receive", "print", "obtain"),
+    "inspect": ("check", "view", "see", "find", "locate", "look", "look up", "lookup", "look for",
+                "consult", "show"),
     "recover": ("recover", "reset", "forgot", "forgotten", "retrieve", "restore", "unlock"),
     "complain": ("complain", "complaint", "claim", "dissatisfied", "unhappy"),
-    "refund": ("refund", "reimburse", "reimbursement", "money back"),
+    "refund": ("refund", "reimburse", "reimbursement", "rebate", "money back", "compensation"),
     "return": ("return", "exchange", "send back"),
     "pay": ("pay", "payment", "charge", "billing"),
     "subscribe": ("subscribe", "subscription", "newsletter", "unsubscribe"),
     "contact": ("contact", "speak", "talk", "call", "human", "agent", "representative"),
 }
-_SUFFIXES = ("", "s", "es", "ed", "d", "ing", "ling", "led", "ation", "ions", "ion", "er")
+_VOWELS = set("aeiou")
 
 
-def _compile_actions(classes: Dict[str, Sequence[str]]) -> List[Tuple[str, re.Pattern]]:
-    compiled = []
-    for name, terms in classes.items():
-        alts = []
-        for t in terms:
-            t = normalize_text(t)
-            if " " in t:
-                alts.append(re.escape(t))
-            else:
-                alts.append(re.escape(t) + "(?:" + "|".join(_SUFFIXES[1:]) + ")?")
-        compiled.append((name, re.compile(r"\b(?:" + "|".join(alts) + r")\b")))
-    return compiled
+def _word_forms(term: str) -> List[str]:
+    """Inflections without a stemmer: get/gets/getting, create/creating/creation, cancel/cancelled."""
+    forms = {term, term + "s", term + "es", term + "ed", term + "d", term + "ing", term + "er",
+             term + "ion", term + "ions", term + "ation", term + "ment"}
+    if term.endswith("e"):
+        stem = term[:-1]
+        forms |= {stem + "ing", stem + "ion", stem + "ation", stem + "ed", stem + "er"}
+    if len(term) >= 3 and term[-1] not in _VOWELS and term[-2] in _VOWELS and term[-3] not in _VOWELS \
+            and term[-1] not in "wxy":
+        forms |= {term + term[-1] + suf for suf in ("ing", "ed", "er", "ation")}
+    return sorted(forms, key=len, reverse=True)
 
 
-def guard_signature(text: str, numbers: bool = True, negation: bool = True,
-                    actions: Optional[List[Tuple[str, re.Pattern]]] = None) -> tuple:
+def _phrase_regex(term: str) -> str:
+    if " ... " in term:  # split phrase: up to 4 words in between
+        a, b = (normalize_text(x) for x in term.split(" ... ", 1))
+        return re.escape(a) + r"(?:\s+\w+){0,4}?\s+" + re.escape(b)
+    t = normalize_text(term)
+    if " " in t:
+        return re.escape(t)
+    return "(?:" + "|".join(re.escape(f) for f in _word_forms(t)) + ")"
+
+
+def _compile_actions(classes: Dict[str, Sequence[str]]):
+    compiled = [(name, re.compile(r"\b(?:" + "|".join(_phrase_regex(t) for t in terms) + r")\b"))
+                for name, terms in classes.items()]
+    # Typo tolerance: adjacent-letter swaps of single-word action terms ("egt" -> "get"),
+    # unless the swapped spelling is itself another action term.
+    singles = {normalize_text(t) for terms in classes.values() for t in terms
+               if " " not in t and len(t) >= 3}
+    typos: Dict[str, str] = {}
+    for t in singles:
+        for i in range(len(t) - 1):
+            swapped = t[:i] + t[i + 1] + t[i] + t[i + 2:]
+            if swapped != t and swapped not in singles:
+                typos.setdefault(swapped, t)
+    return compiled, typos
+
+
+def guard_signature(text: str, numbers: bool = True, negation: bool = True, actions=None) -> tuple:
     norm = normalize_text(text)
+    if actions:
+        compiled, typos = actions
+        norm = " ".join(typos.get(w, w) for w in norm.split())
+        actions = compiled
     nums = tuple(sorted(n.replace(",", "") for n in _NUM.findall(text))) if numbers else ()
     negs = len(_NEG.findall(norm)) % 2 if negation else 0
     acts: FrozenSet[str] = frozenset(n for n, rx in actions if rx.search(norm)) if actions else frozenset()
@@ -105,8 +138,9 @@ class SemanticCache:
         self.config = config or CacheConfig()
         self.store: VectorStore = store or InMemoryVectorStore(self.config.max_entries)
         self.embedder: Embedder = embedder or HashingEmbedder()
-        classes = dict(self.config.action_classes or DEFAULT_ACTION_CLASSES)
-        classes.update(self.config.extra_action_classes)
+        classes = {k: list(v) for k, v in (self.config.action_classes or DEFAULT_ACTION_CLASSES).items()}
+        for name, terms in self.config.extra_action_classes.items():  # same name => add synonyms
+            classes[name] = list(dict.fromkeys(classes.get(name, []) + list(terms)))
         self._actions = _compile_actions(classes) if self.config.guard_actions else None
         self._lock = threading.Lock()
         self.stats = {"hits": 0, "exact_hits": 0, "semantic_hits": 0, "misses": 0, "stores": 0,

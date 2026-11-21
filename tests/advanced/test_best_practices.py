@@ -83,3 +83,130 @@ def test_cascade_best_effort_when_nothing_passes():
     r = gw.generate("How do I reset my password?")
     assert r.quality_warning == "empty response"
     assert not gw.generate("How do I reset my password?").cache_hit  # never cached
+
+
+# ------------------------------------------------- round 2: limitations found by the benchmark
+import pytest
+
+from smartgate import (GroundingValidator, LLMJudgeValidator, QualityTracker, chain, confusion_report,
+                       detect_pii, redact_pii, default_validator)
+from smartgate.analysis import set_phone_regions
+
+
+class TestInternationalPhones:
+    @pytest.mark.parametrize("text", ["call +44 20 7946 0958", "+91 98765 43210", "+49 30 901820",
+                                      "tel: +33 1 42 68 53 00", "+14155550123", "(212) 555-0100"])
+    def test_detected_and_redacted(self, text):
+        assert "phone" in detect_pii(text)
+        assert not any(ch.isdigit() for ch in redact_pii(text).replace("[REDACTED_PHONE]", ""))
+
+    def test_national_format_needs_region(self):
+        pytest.importorskip("phonenumbers")
+        try:
+            assert "phone" not in detect_pii("ring 020 7946 0958")
+            set_phone_regions(["US", "GB"])
+            assert "phone" in detect_pii("ring 020 7946 0958")
+        finally:
+            set_phone_regions(["US"])
+
+    def test_order_numbers_still_safe(self):
+        for t in ("order 732201349959", "invoice 00004587345", "ref INV-48211"):
+            assert "phone" not in detect_pii(t)
+
+
+class TestActionMorphology:
+    @pytest.mark.parametrize("a,b", [
+        ("i need to egt the invoice", "i need to look for the invoice"),      # typo + look for
+        ("I expect a refund of 15 dollars", "refund 15 dollars"),             # track vs request
+        ("set my delivery address up", "change my delivery address"),         # split phrase
+        ("change to the Platinum account", "editing the Platinum account"),   # switch vs edit
+        ("help creating a free account", "help me use another free account"),
+    ])
+    def test_confusable_requests_are_separated(self, a, b):
+        c = SemanticCache(CacheConfig(similarity_threshold=0.3))
+        assert c.signature(a)[2] != c.signature(b)[2]
+
+    def test_inflections_match_their_base(self):
+        c = SemanticCache()
+        assert c.signature("getting my bill")[2] == c.signature("get my bill")[2] == frozenset({"obtain"})
+        assert c.signature("cancelled order")[2] == c.signature("cancel order")[2]
+
+    def test_extra_classes_merge_into_existing(self):
+        c = SemanticCache(CacheConfig(extra_action_classes={"track": ["chase"]}))
+        assert "track" in c.signature("chase my parcel")[2] and "track" in c.signature("track my parcel")[2]
+
+
+def test_confusion_report_names_the_confusing_words():
+    labeled = [("refund 15 dollars", "get_refund"), ("refund 15 dollars please", "get_refund")] * 3
+    labeled += [("refund 15 dollars now", "track_refund")]
+    r = confusion_report(labeled, HashingEmbedder(), CacheConfig(similarity_threshold=0.5))
+    assert r["wrong"] >= 1 and ("get_refund", "track_refund") in [p for p, _ in r["confused_labels"]]
+
+
+class TestGrounding:
+    def _resp(self, text):
+        return ProviderResponse(text, "m", Usage(1, 1), "end_turn")
+
+    def test_invented_eta_is_flagged(self):
+        v = GroundingValidator()
+        problem = v(req("ETA of order 326753?"), self._resp("The ETA for your order 326753 is 2 days."))
+        assert problem and "2 days" in problem
+
+    def test_facts_from_context_or_policy_pass(self):
+        v = GroundingValidator(known_facts=["30 days"])
+        assert v(req("Refund of $49.99 for order 326753"), self._resp("Your $49.99 refund for 326753 is on its way.")) is None
+        assert v(req("return policy?"), self._resp("You can return items within 30 days.")) is None
+        assert v(req("hi", system="Refunds take 5-7 business days."), self._resp("Refunds take 5-7 business days.")) is None
+
+    def test_chain_and_judge(self):
+        judge = LLMJudgeValidator(lambda r, a: 0.9 if "Settings" in a else 0.2, min_score=0.5)
+        v = chain(default_validator, judge)
+        assert v(req("reset password?"), self._resp("Go to Settings.")) is None and judge.last_score == 0.9
+        assert v(req("reset password?"), self._resp("Not sure.")) == "judge score 0.20"
+
+
+def test_grounding_escalates_through_gateway():
+    from smartgate.quality import GroundingValidator, chain
+    answers = {"small": "Your order arrives in 2 days.", "medium": "I can't see delivery dates; check the "
+               "tracking link in your confirmation email.", "large": "L"}
+    calls = []
+
+    def fn(model, request):
+        calls.append(model.tier)
+        return ProviderResponse(answers[model.tier], model.name, Usage(5, 5), "end_turn")
+    gw = Gateway(models=MODELS, providers={"mock": CallableProvider("mock", fn)},
+                 validator=chain(default_validator, GroundingValidator()))
+    r = gw.generate("When will my order arrive?")
+    assert r.model == "medium-a" and calls == ["small", "medium"]
+
+
+class TestAdaptiveRouting:
+    def _gw(self, small_answer):
+        def fn(model, request):
+            text = small_answer if model.tier == "small" else "Use the reset link in Settings."
+            return ProviderResponse(text, model.name, Usage(5, 5), "end_turn")
+        return Gateway(models=MODELS, providers={"mock": CallableProvider("mock", fn)},
+                       quality_tracker=QualityTracker(min_score=0.7, min_samples=5))
+
+    def test_failing_small_tier_gets_bypassed_for_that_key_only(self):
+        gw = self._gw("")  # small always returns empty -> validator fails
+        for i in range(5):
+            gw.generate(f"reset question {i}", use_cache=False, metadata={"route_key": "reset_password"})
+        r = gw.generate("reset question 99", use_cache=False, metadata={"route_key": "reset_password"})
+        assert r.model == "medium-a" and "quality floor" in r.route_reason and len(r.attempts) == 1
+        other = gw.generate("other question", use_cache=False, metadata={"route_key": "track_order"})
+        assert "quality floor" not in other.route_reason  # other keys unaffected
+
+    def test_user_feedback_drives_the_floor(self):
+        gw = self._gw("Use the reset link in Settings.")  # passes validation, but users dislike it
+        first = gw.generate("q 0", use_cache=False, metadata={"route_key": "billing"})
+        assert first.model == "small-a"
+        assert gw.feedback(first.request_id, 0.0)
+        served = [first.model]
+        for i in range(1, 8):
+            r = gw.generate(f"q {i}", use_cache=False, metadata={"route_key": "billing"})
+            served.append(r.model)
+            if r.model == "small-a":
+                gw.feedback(r.request_id, 0.0)  # thumbs-down on every small-tier answer
+        assert served[-1] == "medium-a" and "small-a" in served
+        assert not gw.feedback("unknown-id", 1.0)

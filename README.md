@@ -34,6 +34,7 @@ pip install -e ".[anthropic,fast,dev]"
 |---|---|
 | `anthropic` | Claude provider (official `anthropic` SDK) |
 | `fast` | NumPy-accelerated cache search (~0.4 ms at 10k entries vs ~150 ms in pure Python) |
+| `pii` | International phone-number detection (Google's libphonenumber) |
 | `yaml` | YAML config files |
 | `dev` | pytest, hypothesis |
 
@@ -73,6 +74,7 @@ Run without an API key: `python examples/quickstart.py`, which uses the offline 
   result = calibrate_threshold(labeled_queries, embedder, max_wrong_per_1000=0.5)  # [(text, label), ...]
   result["threshold"], result["table"]   # best threshold within the wrong-answer budget, full sweep
   ```
+- **Find what confuses the cache:** `confusion_report(labeled, embedder, config)` lists the label pairs and words behind wrong hits (e.g. "expect" vs "refund" = tracking vs requesting a refund), so you can add synonym groups with `extra_action_classes` (same-named groups merge). Action matching handles inflections ("getting", "creating", "cancelled"), adjacent-letter typos ("egt") and split phrases ("set my address up").
 - **Seed approved answers:** `gw.cache.seed("What is your return policy?", approved_text, tenant_id="shop", system=SYSTEM)`.
 - **Safety:** prompts containing PII or time-sensitive words ("today", "latest", "stock price") are not cached unless you opt in.
 - **Backends:** `InMemoryVectorStore`, `SQLiteVectorStore` (durable), or implement `VectorStore` for Redis, pgvector, Qdrant or Pinecone.
@@ -112,11 +114,14 @@ PromptAnalyzer(domain_keywords={"indemnif": 0.25},
 - **Retry** with exponential backoff, jitter, and `retry-after` support. Only transient errors are retried: rate limits, 5xx, timeouts and connection errors.
 - **Circuit breaker** per model (closed → open → half-open), so a failing model is skipped instantly.
 - **Fallback chain:** `same_tier_then_up` (the default: escalate for quality, then degrade for availability), `same_tier_then_down`, or `any`.
+- **Grounding check (support, finance, healthcare, e-commerce presets):** an answer that states a duration, amount, date or reference number that appears nowhere in the conversation, system prompt or your `known_facts` (e.g. "30 days", "5-7 business days") is treated as invented and escalated. `GroundingValidator(known_facts=[...])`.
+- **LLM judge:** `LLMJudgeValidator(judge_fn, min_score=0.6)` scores answers with any judge model; combine checks with `chain(default_validator, GroundingValidator(), judge)`.
+- **Adaptive routing:** with `Gateway(quality_tracker=QualityTracker(min_score=0.8, min_samples=30))` the gateway keeps a quality score per route key (`metadata={"route_key": intent}`, else the task type) and tier, from validator outcomes and `gw.feedback(request_id, score)` (thumbs up/down, human review). When the cheap tier falls below the bar for a key, that key is routed one tier up; other keys keep the cheap tier.
 - **Cascade on bad answers:** every answer passes a validator (default: empty, refusal-style or unfilled-template answers fail). A failed answer is billed but never cached, and the request escalates to the next tier up. If no tier passes, the last answer is returned with `quality_warning` set. Plug in your own check (an LLM judge, a schema check) with `Gateway(validator=fn)`, or pass `validator=None` to turn it off.
 - **Refusals** (`stop_reason == "refusal"`) fail over to the next model. Bad requests are raised immediately, because another model wouldn't fix them.
 
 ### 6. Policy and observability
-- `PolicyConfig(pii="allow|redact|block", blocked_terms=[...], max_input_tokens=...)`. Redaction runs before the model call and before the cache key is built.
+- `PolicyConfig(pii="allow|redact|block", blocked_terms=[...], max_input_tokens=..., phone_regions=["US", "GB"])`. Install the `pii` extra (Google's libphonenumber) for international phone numbers; `phone_regions` adds national formats such as UK `020 7946 0958`. Redaction runs before the model call and before the cache key is built.
 - Hooks: `gw.on("cache.hit" | "fallback" | "budget.exceeded" | "*", fn)`. Use them to bridge into OpenTelemetry, Prometheus, Datadog or an audit log. A hook that throws never breaks a request.
 
 ## Industry presets
@@ -196,7 +201,7 @@ On 26,872 real-style support messages (Bitext dataset), with thresholds calibrat
 ## Testing
 
 ```bash
-pytest -q                                              # 113 tests, ~15 s, fully offline
+pytest -q                                              # 135 tests, ~15 s, fully offline
 SMARTGATE_FUZZ=3000 pytest tests/advanced/test_properties.py   # deeper fuzzing
 ```
 
@@ -232,7 +237,7 @@ smartgate/
   providers/        Provider base, AnthropicProvider, CallableProvider, MockProvider
   config.py         dict/JSON/YAML config + industry presets
   server.py client.py cli.py observability.py
-tests/              113 tests: unit, e2e, HTTP, property-based, concurrency, chaos, quality benchmarks
+tests/              135 tests: unit, e2e, HTTP, property-based, concurrency, chaos, quality benchmarks
 ```
 
 ## License

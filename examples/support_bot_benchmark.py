@@ -73,7 +73,7 @@ def load(path: str, seed: int = 7, pii_rate: float = 0.05):
             pii = rnd.choice([f"my email is cust{rnd.randint(1, 9999)}@example.com",
                               f"call me at 555-{rnd.randint(100, 999)}-{rnd.randint(1000, 9999)}"])
             text = f"{text} {pii}"
-        out.append({"text": text, "intent": r["intent"], "category": r["category"],
+        out.append({"text": text, "intent": r["intent"], "category": r["category"], "reference": r["response"],
                     "flags": r["flags"], "pii": pii})
     rnd.shuffle(out)
     return out
@@ -272,6 +272,113 @@ def run_live(data, models_dir, embedder, threshold, n, kill_at):
     }
 
 
+def answer_quality(nomic, answer: str, reference: str) -> float:
+    """Semantic agreement between a model answer and Bitext's human-written reference reply."""
+    from smartgate.embeddings import _l2, cosine
+    return cosine(_l2(nomic.embed(answer[:1500])), _l2(nomic.embed(reference[:1500])))
+
+
+def run_quality_live(data, models_dir, nomic, cache_embedder, threshold, n_probe, n_live, kill_at):
+    """Phase 1: the same questions on every tier (is the small tier good enough?).
+    Phase 2: gateway with grounding checks + adaptive routing driven by reviewer feedback."""
+    from smartgate import GroundingValidator, QualityTracker, ResilienceConfig, RetryPolicy, chain, default_validator
+    local = LocalModels(models_dir)
+    grounding = GroundingValidator()
+    rnd = random.Random(11)
+    test = data[len(data) // 2:]
+    probe_set = rnd.sample(test, n_probe)
+
+    # ---- phase 1: quality probe, every tier answers the same questions
+    probe = {}
+    for _, tier, _, _, claude in TIERS:
+        spec = ModelSpec(claude, "local", tier, 0, 0)
+        scores, invented, lat = [], 0, []
+        for d in probe_set:
+            req = __import__("smartgate").GatewayRequest(messages=[{"role": "user", "content": d["text"]}],
+                                                       system=SYSTEM, max_tokens=96)
+            t0 = time.perf_counter()
+            r = local(spec, req)
+            lat.append(time.perf_counter() - t0)
+            scores.append(answer_quality(nomic, r.text, d["reference"]))
+            invented += bool(grounding(req, r))
+        probe[tier] = {"model": claude, "mean_reference_similarity": round(statistics.mean(scores), 4),
+                       "median_reference_similarity": round(statistics.median(scores), 4),
+                       "invented_fact_rate": round(invented / len(probe_set), 3),
+                       "p50_latency_s": round(statistics.median(lat), 2)}
+        print(json.dumps({"probe_tier": tier, **probe[tier]}), flush=True)
+    bar = probe["large"]["median_reference_similarity"] - 0.02  # "about as good as the large tier"
+
+    # ---- phase 2: adaptive gateway
+    tracker = QualityTracker(min_score=0.6, min_samples=6)
+    gw = Gateway(models=shadow_models("local"), providers={"local": CallableProvider("local", local)},
+                 cache=SemanticCache(CacheConfig(similarity_threshold=threshold, ttl_seconds=None),
+                                     embedder=cache_embedder),
+                 policy=PolicyConfig(pii="redact"),
+                 resilience=ResilienceConfig(retry=RetryPolicy(max_attempts=2, base_delay=0.1),
+                                             breaker_failure_threshold=3),
+                 validator=chain(default_validator, grounding), quality_tracker=tracker)
+    pool = [d for d in test if d not in probe_set]
+    sample = rnd.sample(pool, n_live)
+    hot = sample[:40]
+    traffic = [rnd.choice(hot) if rnd.random() < 0.35 else d for d in sample]
+    rows, failures, baseline, cost = [], 0, 0.0, 0.0
+    t_start = time.perf_counter()
+    for i, d in enumerate(traffic):
+        if i == kill_at:
+            local.down.add("claude-opus-5-5")
+        t0 = time.perf_counter()
+        try:
+            r = gw.generate(d["text"], system=SYSTEM, max_tokens=96, metadata={"route_key": d["intent"]})
+        except Exception:  # noqa
+            failures += 1
+            continue
+        q = answer_quality(nomic, r.text, d["reference"])
+        if not r.cache_hit:  # simulated reviewer: thumbs-up when the answer is about as good as the large tier
+            gw.feedback(r.request_id, 1.0 if q >= bar else 0.0)
+        u_in = r.usage.input_tokens or estimate_tokens(SYSTEM + d["text"])
+        u_out = r.usage.output_tokens or 60
+        baseline += (u_in * OPUS_IN + u_out * OPUS_OUT) / 1e6
+        cost += r.cost_usd
+        rows.append({"i": i, "model": "cache" if r.cache_hit else r.model, "q_score": q,
+                     "latency_s": time.perf_counter() - t0, "after_kill": i >= kill_at,
+                     "escalations": [a.error for a in r.attempts if (a.error or "").startswith("quality:")],
+                     "floor": "quality floor" in r.route_reason, "warning": r.quality_warning,
+                     "intent": d["intent"], "question": d["text"], "answer": r.text})
+    model_rows = [x for x in rows if x["model"] != "cache"]
+    esc = Counter(e.split(":", 1)[1].split(":")[0].strip() for x in rows for e in x["escalations"])
+    floors = sorted({x["intent"] for x in rows if x["floor"]})
+    half = len(model_rows) // 2
+    return {
+        "quality_probe_same_questions_each_tier": probe,
+        "reviewer_bar_reference_similarity": round(bar, 4),
+        "live": {
+            "requests": len(traffic), "failed_requests": failures,
+            "served_by": dict(Counter(x["model"] for x in rows)),
+            "cache_hit_rate": round(sum(x["model"] == "cache" for x in rows) / len(rows), 3),
+            "quality_escalations_by_reason": dict(esc),
+            "answers_flagged_no_tier_passed": sum(1 for x in rows if x["warning"]),
+            "intents_moved_up_by_adaptive_routing": floors,
+            "requests_routed_up_by_quality_floor": sum(1 for x in rows if x["floor"]),
+            "mean_answer_quality_delivered": round(statistics.mean(x["q_score"] for x in rows), 4),
+            "mean_answer_quality_first_half_vs_second_half": [
+                round(statistics.mean(x["q_score"] for x in model_rows[:half]), 4),
+                round(statistics.mean(x["q_score"] for x in model_rows[half:]), 4)],
+            "large_tier_killed_at_request": kill_at,
+            "after_kill_served_by": dict(Counter(x["model"] for x in rows if x["after_kill"])),
+            "circuit_breakers": gw.stats()["circuit_breakers"],
+            "latency_cache_hit_ms_p50": round(1000 * statistics.median(
+                [x["latency_s"] for x in rows if x["model"] == "cache"] or [0]), 2),
+            "shadow_cost_usd": round(cost, 5), "baseline_all_opus_no_cache_usd": round(baseline, 5),
+            "savings_pct": round(100 * (1 - cost / baseline), 1) if baseline else None,
+            "wall_clock_min": round((time.perf_counter() - t_start) / 60, 1),
+            "tracker": tracker.report(),
+            "invented_fact_examples_caught": [
+                {"q": x["question"], "rejected": x["escalations"]} for x in rows
+                if any("unsupported specific" in e for e in x["escalations"])][:5],
+        },
+    }
+
+
 def part_a(data, embedders, max_wrong_per_1000):
     """Before/after on a train/test split: thresholds are chosen on train, reported on test."""
     from smartgate import calibrate_threshold
@@ -304,7 +411,8 @@ def main():
     ap.add_argument("--data", required=True)
     ap.add_argument("--models-dir")
     ap.add_argument("--part", choices=["cache", "live", "all"], default="cache")
-    ap.add_argument("--live-n", type=int, default=200)
+    ap.add_argument("--live-n", type=int, default=400)
+    ap.add_argument("--probe-n", type=int, default=60)
     ap.add_argument("--max-wrong-per-1000", type=float, default=0.5,
                     help="wrong-answer budget used to calibrate the threshold")
     ap.add_argument("--out", default="support_benchmark_results.json")
@@ -332,9 +440,14 @@ def main():
 
     if args.part in ("live", "all"):
         emb = embedders[best[0]]
-        results["live"] = run_live(data, args.models_dir, emb, best[1], args.live_n, kill_at=args.live_n // 2)
-        results["live"]["cache_embedder"], results["live"]["cache_threshold"] = best
-        print(json.dumps({k: v for k, v in results["live"].items() if k != "sample_answers"}, indent=1))
+        if not nomic:
+            raise SystemExit("--part live needs nomic-embed-text-v1.5 in --models-dir to score answer quality")
+        results["quality_live"] = run_quality_live(data, args.models_dir, nomic, emb, best[1],
+                                                   n_probe=args.probe_n, n_live=args.live_n,
+                                                   kill_at=args.live_n // 2)
+        results["quality_live"]["cache_embedder"], results["quality_live"]["cache_threshold"] = best
+        nomic.save()
+        print(json.dumps(results["quality_live"], indent=1, ensure_ascii=False))
 
     with open(args.out, "w") as f:
         json.dump(results, f, indent=2, ensure_ascii=False)

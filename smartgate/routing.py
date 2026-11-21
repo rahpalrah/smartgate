@@ -81,7 +81,7 @@ class ModelRouter:
                 if m.enabled and m.max_context_tokens >= need and caps.issubset(m.capabilities)]
 
     def route(self, request: GatewayRequest, analysis: PromptAnalysis,
-              budget_pressure: bool = False) -> RouteDecision:
+              budget_pressure: bool = False, floor_tier: Optional[str] = None) -> RouteDecision:
         eligible = self._eligible(request, analysis)
         if not eligible:
             raise ConfigError("No enabled model fits this request (context window / capabilities)")
@@ -115,6 +115,9 @@ class ModelRouter:
             if budget_pressure and self.config.downgrade_on_budget_pressure and tier_index(tier) > 0:
                 tier = TIERS[tier_index(tier) - 1]
                 reasons.append(f"budget pressure -> downgraded to {tier}")
+            if floor_tier and tier_index(tier) < tier_index(floor_tier):
+                tier = floor_tier
+                reasons.append(f"quality floor -> {tier} (cheaper tier below quality bar)")
             clamped = self._clamp(tier)
             if clamped != tier:
                 reasons.append(f"clamped to {clamped}")

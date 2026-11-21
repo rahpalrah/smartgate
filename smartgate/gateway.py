@@ -15,7 +15,7 @@ from .errors import (AllModelsFailedError, BudgetExceededError, ConfigError,
                      PolicyViolationError, ProviderError)
 from .observability import EventBus, Metrics
 from .providers.base import Provider
-from .quality import Validator, default_validator
+from .quality import QualityTracker, Validator, default_validator
 from .resilience import BreakerRegistry, RetryPolicy
 from .routing import ModelRouter, RoutingConfig, RoutingRule, tier_index
 from .types import Attempt, GatewayRequest, GatewayResponse, Message, Usage
@@ -26,6 +26,7 @@ class PolicyConfig:
     pii: str = "allow"  # "allow" | "redact" | "block"
     max_input_tokens: Optional[int] = None
     blocked_terms: List[str] = field(default_factory=list)
+    phone_regions: Optional[List[str]] = None  # e.g. ["US", "GB", "IN"] for national phone formats
 
 
 @dataclass
@@ -60,6 +61,7 @@ class Gateway:
         sleep=time.sleep,
         coalesce_timeout: float = 300.0,
         validator: Optional[Validator] = default_validator,
+        quality_tracker: Optional[QualityTracker] = None,
     ) -> None:
         missing = {m.provider for m in models} - set(providers)
         if missing:
@@ -70,6 +72,9 @@ class Gateway:
         self.analyzer = analyzer or PromptAnalyzer()
         self.costs = costs or CostController(default_budget=default_budget)
         self.policy = policy or PolicyConfig()
+        if self.policy.phone_regions:
+            from .analysis import set_phone_regions
+            set_phone_regions(self.policy.phone_regions)
         self.resilience = resilience or ResilienceConfig()
         self.breakers = BreakerRegistry(self.resilience.breaker_failure_threshold,
                                         self.resilience.breaker_recovery_seconds)
@@ -80,6 +85,11 @@ class Gateway:
         # for the first one in flight instead of all calling the model (cache stampede).
         self.coalesce_timeout = coalesce_timeout
         self.validator = validator
+        # Adaptive routing: when set, route keys whose cheap tier scores below the bar are
+        # routed one tier up. Scores come from validator outcomes and Gateway.feedback().
+        self.quality = quality_tracker
+        from collections import OrderedDict
+        self._served: "OrderedDict[str, tuple]" = OrderedDict()  # request_id -> (route_key, tier)
         self._inflight: Dict[str, threading.Event] = {}
         self._inflight_lock = threading.Lock()
 
@@ -117,6 +127,22 @@ class Gateway:
     async def agenerate(self, prompt: Union[str, GatewayRequest, List[Any]], **kwargs: Any) -> GatewayResponse:
         return await asyncio.to_thread(self.generate, prompt, **kwargs)
 
+    def feedback(self, request_id: str, score: float) -> bool:
+        """Report answer quality in [0, 1] (thumbs up = 1, down = 0, or a review score).
+        Returns False if the request is unknown (too old) or adaptive routing is off."""
+        served = self._served.get(request_id)
+        if not served or not self.quality:
+            return False
+        self.quality.record(served[0], served[1], score)
+        return True
+
+    def _remember(self, rid: str, key: str, tier: str) -> None:
+        if self.quality is None:
+            return
+        self._served[rid] = (key, tier)
+        while len(self._served) > 50_000:
+            self._served.popitem(last=False)
+
     def set_budget(self, tenant_id: str, budget: Budget) -> None:
         self.costs.set_budget(tenant_id, budget)
 
@@ -128,6 +154,7 @@ class Gateway:
             "cost": {"total_usd": round(self.costs.total_cost, 6),
                      "saved_usd": round(self.costs.total_saved, 6)},
             "circuit_breakers": self.breakers.states(),
+            "quality": self.quality.report() if self.quality else None,
         })
         return snap
 
@@ -209,6 +236,9 @@ class Gateway:
                 e = hit.entry
                 self.metrics.incr("cache_hits")
                 self.costs.record(request.tenant_id, e.model, 0.0, 0, 0, cache_hit=True, saved=e.cost_usd)
+                spec = self.router.get(e.model)
+                if spec:
+                    self._remember(rid, str(request.metadata.get("route_key") or analysis.task_type), spec.tier)
                 self.events.emit("cache.hit", {"request_id": rid, "similarity": hit.similarity,
                                                "exact": hit.exact, "model": e.model})
                 return GatewayResponse(
@@ -224,7 +254,9 @@ class Gateway:
         pressure = self.costs.should_downgrade(request.tenant_id)
         if pressure:
             self.events.emit("budget.downgrade", {"request_id": rid, "tenant_id": request.tenant_id})
-        decision = self.router.route(request, analysis, budget_pressure=pressure)
+        route_key = str(request.metadata.get("route_key") or analysis.task_type)
+        floor = self.quality.floor_tier(route_key) if self.quality else None
+        decision = self.router.route(request, analysis, budget_pressure=pressure, floor_tier=floor)
         self.events.emit("route.decided", {"request_id": rid, "model": decision.primary.name,
                                            "tier": decision.tier, "reason": decision.reason})
 
@@ -284,6 +316,8 @@ class Gateway:
             self.metrics.incr(f"model.{model.name}")
             spent += cost
             problem = self.validator(request, result) if self.validator else None
+            if self.quality is not None and self.validator is not None:
+                self.quality.record(route_key, model.tier, 0.0 if problem else 1.0)
             if problem:
                 attempts.append(Attempt(model.name, model.provider, False, f"quality: {problem}", _ms(t0)))
                 self.metrics.incr("quality_escalations")
@@ -300,6 +334,7 @@ class Gateway:
                 if self.cache.store_response(request, result.text, model.name, cost,
                                              result.usage.input_tokens, result.usage.output_tokens, partition):
                     self.events.emit("cache.store", {"request_id": rid})
+            self._remember(rid, route_key, model.tier)
             return GatewayResponse(
                 text=result.text, model=model.name, provider=model.provider, usage=result.usage,
                 cost_usd=spent, route_reason=reason, analysis=analysis.to_dict(),

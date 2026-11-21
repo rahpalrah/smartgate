@@ -42,6 +42,7 @@ PRESETS: Dict[str, Dict[str, Any]] = {
         "routing": {"min_tier": "medium"},
         "domain_keywords": {"diagnosis": 0.25, "differential": 0.25, "dosage": 0.3,
                             "contraindication": 0.3, "drug interaction": 0.3, "symptom": 0.1},
+        "quality": {"grounding": True, "adaptive_routing": {"min_score": 0.85, "min_samples": 30}},
         "rules": [{"name": "clinical-safety", "keywords": ["dosage", "contraindication",
                                                            "drug interaction", "overdose"],
                    "tier": "large"}],
@@ -51,6 +52,7 @@ PRESETS: Dict[str, Dict[str, Any]] = {
         "policy": {"pii": "redact"},
         "domain_keywords": {"portfolio": 0.15, "risk": 0.1, "valuation": 0.2, "regulation": 0.2,
                             "derivative": 0.2, "compliance": 0.2, "audit": 0.15},
+        "quality": {"grounding": True, "adaptive_routing": {"min_score": 0.85, "min_samples": 30}},
         "rules": [{"name": "regulatory", "keywords": ["sec filing", "aml", "kyc", "basel", "compliance"],
                    "min_tier": "medium"}],
     },
@@ -58,12 +60,14 @@ PRESETS: Dict[str, Dict[str, Any]] = {
         "cache": {"similarity_threshold": 0.86, "ttl_seconds": 24 * 3600},
         "policy": {"pii": "redact"},
         "routing": {"small_max": 0.45, "medium_max": 0.80},
+        "quality": {"grounding": True, "adaptive_routing": {"min_score": 0.8, "min_samples": 30}},
         "rules": [{"name": "catalog-copy", "task_types": ["creative"], "tier": "medium"}],
     },
     "customer_support": {
         "cache": {"similarity_threshold": 0.88, "ttl_seconds": 12 * 3600},
         "policy": {"pii": "redact"},
         "routing": {"small_max": 0.45},
+        "quality": {"grounding": True, "adaptive_routing": {"min_score": 0.8, "min_samples": 30}},
         "rules": [{"name": "escalation", "keywords": ["refund", "legal action", "cancel my account",
                                                       "complaint"], "min_tier": "medium"}],
     },
@@ -179,6 +183,13 @@ def gateway_from_config(config: Dict[str, Any], providers: Optional[Dict[str, Pr
         budgets={t: Budget(**b) for t, b in cfg.get("budgets", {}).items()},
         default_budget=Budget(**cfg["default_budget"]) if cfg.get("default_budget") else None,
     )
+    q = cfg.get("quality", {})
+    from .quality import GroundingValidator, QualityTracker, chain, default_validator
+    validator = chain(default_validator, GroundingValidator(q.get("known_facts")) if q.get("grounding") else None)
+    adaptive = q.get("adaptive_routing")
+    gateway_kwargs.setdefault("validator", validator)
+    if adaptive:
+        gateway_kwargs.setdefault("quality_tracker", QualityTracker(**adaptive))
     return Gateway(
         models=models,
         providers=build_providers({m.provider for m in models}, providers),

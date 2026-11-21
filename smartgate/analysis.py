@@ -19,11 +19,49 @@ PII_PATTERNS: Dict[str, re.Pattern] = {
     "iban": re.compile(r"\b[A-Z]{2}\d{2}[A-Z0-9]{11,30}\b"),
     "mrn": re.compile(r"\b(?:MRN|medical record(?: number)?)[:#\s]*\d{5,}\b", re.I),
     "ip_address": re.compile(r"\b(?:\d{1,3}\.){3}\d{1,3}\b"),
-    # Separators, parentheses or a leading "+" are required: bare digit runs are order,
-    # invoice or tracking numbers far more often than phone numbers.
-    "phone": re.compile(r"(?<![\w+])(?:\+\d{1,3}[\s.-]?)?(?:\(\d{3}\)\s?|\d{3}[\s.-])\d{3}[\s.-]\d{4}(?!\d)"
-                        r"|\+\d{10,14}\b"),
 }
+
+# Phone numbers. With `phonenumbers` (Google's libphonenumber) installed, numbers are validated
+# per region, which catches international formats. Without it, regexes cover North American
+# and +country-code formats. Either way a match needs separators, parentheses or a leading "+":
+# bare digit runs are order/invoice/tracking numbers far more often than phone numbers.
+try:
+    import phonenumbers as _pn
+except ImportError:  # pragma: no cover
+    _pn = None
+PHONE_REGIONS: List[str] = ["US"]
+_US_PHONE = re.compile(r"(?<![\w+])(?:\+\d{1,3}[\s.-]?)?(?:\(\d{3}\)\s?|\d{3}[\s.-])\d{3}[\s.-]\d{4}(?!\d)")
+_INTL_PHONE = re.compile(r"(?<![\w+])\+\d{1,3}(?:[\s.-]?\(?\d{1,5}\)?){1,6}(?![\w])")
+_SEPARATED = re.compile(r"[\s().+-]")
+
+
+def set_phone_regions(regions: List[str]) -> None:
+    """Countries whose *national* formats (e.g. GB "020 7946 0958") should be detected."""
+    PHONE_REGIONS[:] = [r.upper() for r in regions]
+
+
+def _phone_spans(text: str) -> List[Tuple[int, int]]:
+    spans: List[Tuple[int, int]] = []
+    if _pn is not None:
+        for region in PHONE_REGIONS:
+            for m in _pn.PhoneNumberMatcher(text, region, leniency=_pn.Leniency.VALID):
+                if _SEPARATED.search(m.raw_string):
+                    spans.append((m.start, m.end))
+    for rx in (_US_PHONE, _INTL_PHONE):
+        for m in rx.finditer(text):
+            digits = sum(ch.isdigit() for ch in m.group())
+            if 8 <= digits <= 15:
+                spans.append(m.span())
+    spans.sort()
+    merged: List[Tuple[int, int]] = []
+    for a, b in spans:
+        if merged and a <= merged[-1][1]:
+            merged[-1] = (merged[-1][0], max(b, merged[-1][1]))
+        else:
+            merged.append((a, b))
+    return merged
+
+
 # Maximal runs of digits joined by single spaces/dashes; card numbers are searched inside them.
 _DIGIT_RUN = re.compile(r"\d(?:[ -]?\d)*")
 
@@ -70,6 +108,8 @@ def _card_spans(text: str) -> List[Tuple[int, int]]:
 def detect_pii(text: str) -> List[str]:
     found = ["credit_card"] if _card_spans(text) else []
     found += [kind for kind, pattern in PII_PATTERNS.items() if pattern.search(text)]
+    if _phone_spans(text):
+        found.append("phone")
     return found
 
 
@@ -79,6 +119,8 @@ def redact_pii(text: str) -> str:
         text = text[:start] + "[REDACTED_CREDIT_CARD]" + text[end:]
     for kind, pattern in PII_PATTERNS.items():
         text = pattern.sub(f"[REDACTED_{kind.upper()}]", text)
+    for start, end in reversed(_phone_spans(text)):
+        text = text[:start] + "[REDACTED_PHONE]" + text[end:]
     return text
 
 
