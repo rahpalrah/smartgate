@@ -1,47 +1,74 @@
 # Benchmark: e-commerce customer support on real data (free)
 
-Reproduce: `python examples/support_bot_benchmark.py --data <bitext.csv> --models-dir <models> --part all --live-n 200`
+Reproduce:
+```bash
+python examples/support_bot_benchmark.py --data <bitext.csv> --models-dir <models> --part all
+```
 
 ## Setup
 
 | | |
 |---|---|
-| Data | [Bitext customer-support dataset](https://huggingface.co/datasets/bitext/Bitext-customer-support-llm-chatbot-training-dataset) (CDLA-Sharing-1.0): 26,872 messages, 27 intents, 11 categories. Only ~10% are exact repeats. |
+| Data | [Bitext customer-support dataset](https://huggingface.co/datasets/bitext/Bitext-customer-support-llm-chatbot-training-dataset) (CDLA-Sharing-1.0): 26,872 messages, 27 intents, 11 categories, each with a human-written reference reply. Only ~10% of messages are exact repeats. |
 | Realism | Placeholders filled with synthetic order numbers, names, amounts and cities; synthetic emails/phones planted in 5% of messages. |
-| Method | Shuffled, split 50/50. Similarity thresholds were **chosen on the train half** with `calibrate_threshold(max_wrong_per_1000=0.5)`; **every number below is from the unseen test half** (13,436 messages). |
-| Correctness | Each cache hit is checked against the intent labels: a hit that returns another intent's answer is a **wrong answer**. |
-| Models (live run) | Free, local, CPU-only: Qwen2.5 0.5B / 1.5B / 3B Instruct (Q4_K_M) as small / medium / large tiers, via llama-cpp-python. |
+| Method | Shuffled, split 50/50. Cache thresholds and synonym groups were **derived from the train half only**; **every number below is from the unseen test half**. |
+| Cache correctness | A cache hit that returns another intent's answer is a **wrong answer**. |
+| Answer quality | Semantic similarity (nomic-embed-text-v1.5) between each model answer and Bitext's human-written reference reply, plus the grounding check for invented facts. |
+| Models | Free, local, CPU-only: Qwen2.5 0.5B / 1.5B / 3B Instruct (Q4_K_M) as small / medium / large tiers via llama-cpp-python. |
 | Cost | Calls were free; tiers are *shadow priced* at Claude Haiku 5.5 / Sonnet 5.5 / Opus 5.5 list prices. Baseline = every request to Opus, no cache. |
 
-## Semantic cache: before vs. after (test half, 13,436 messages)
+## 1. Semantic cache (test half, 13,436 messages)
 
-| Embedder | Configuration | Threshold | Served from cache | Wrong answers / 1,000 requests | Hit precision |
+| Embedder | Configuration | Threshold | Served from cache | Wrong answers / 1,000 | Hit precision |
 |---|---|---|---|---|---|
-| Built-in (hashing) | before: number + negation guards | 0.90 | 9.0% | 0.00 | 100% |
-| Built-in (hashing) | **after**: + action guard, calibrated | 0.80 | **23.2%** | 0.52 | 99.78% |
-| nomic-embed-text-v1.5 | before: number + negation guards | 0.90 | 74.0% | **46.2** | 93.75% |
-| nomic-embed-text-v1.5 | **after**: + action guard, calibrated | 0.98 | **26.3%** | **0.07** | **99.97%** |
+| nomic-embed-text-v1.5 | v1: number + negation guards, guessed threshold | 0.90 | 74.0% | **46.2** | 93.75% |
+| nomic-embed-text-v1.5 | v2: + action guard, calibrated | 0.98 | 26.3% | 0.07 | 99.97% |
+| nomic-embed-text-v1.5 | **v3: + inflections, typos, split phrases, train-derived synonyms** | 0.98 | **27.0%** | **0.00** | **100%** |
+| Built-in (hashing) | v1 | 0.90 | 9.0% | 0.00 | 100% |
+| Built-in (hashing) | v3 | 0.80 | 23.2% | 0.22 | 99.90% |
 
-Takeaways:
-- A neural embedder with a guessed threshold looks great on hit rate (74%) but **1 in 16 cached answers was for a different request** (e.g. "check my invoice" answered with "send my invoice"). Hit rate alone is a misleading metric.
-- Verification (action guard) + calibration cut wrong answers from 46.2 to 0.07 per 1,000 (**660× fewer**) while still serving 26% of traffic from cache, about **3× the built-in baseline**.
-- Remaining errors are near-synonymous intents ("I expect a rebate" = *track* refund vs. "rebate 120 dollars" = *get* refund). Domain-specific action classes (`extra_action_classes`) are the lever for those.
-- PII: 679 test messages carried synthetic emails/phones; **0 reached a model**.
+- With a guessed threshold, a neural embedder serves 74% of traffic but **1 in 16 cached answers is for a different request**. Hit rate alone is misleading.
+- Verification and calibration removed every wrong answer on the held-out half while still serving 27% of requests from cache.
+- PII: 679 test messages carried synthetic emails or phone numbers; **0 reached a model**.
 
-## Live run with real local models (200 requests)
+## 2. Is the small tier good enough? (the same 60 test questions on every tier)
+
+| Tier | Reference similarity (mean) | Answers with invented facts | p50 latency |
+|---|---|---|---|
+| small (0.5B) | 0.832 | 3.3% | 1.1 s |
+| medium (1.5B) | 0.848 | 0.0% | 2.1 s |
+| large (3B) | 0.870 | **6.7%** | 3.2 s |
+
+The small tier is measurably below the large one, but not uniformly. Adaptive routing (section 3) decides per intent instead of all or nothing. The largest model invented the most facts, so a bigger model does not remove the need for the grounding check.
+
+## 3. Live run: grounding + adaptive routing + failover (400 requests)
+
+A simulated reviewer gave each answer thumbs-up when its reference similarity reached the large tier's median (minus 0.02), via `gw.feedback()`. The large tier was killed at request 200.
 
 | Metric | Result |
 |---|---|
-| Failed requests | **0 / 200** |
-| Served by | cache 53 · small 124 · medium 13 · large 10 |
-| Cache-hit latency (p50) | **0.29 ms** |
-| Model-call latency (p50) | 1.42 s (small 1.06 s · medium 1.89 s · large 3.93 s generation) |
-| Large tier killed at request 100 | Circuit breaker opened; the 5 large-tier requests after it were rerouted; 0 errors |
-| Quality cascade | 21 answers rejected (empty / refusal-style) and escalated to a higher tier; 5 failed every tier and were returned flagged, uncached |
-| Shadow cost vs. always-Opus | $0.0248 vs $0.2554 (**90.3% lower**) |
+| Failed requests | **0 / 400** |
+| Served by | cache 120 · small 207 · medium 63 · large 10 |
+| Cache-hit latency (p50) | 0.53 ms |
+| Invented facts caught and escalated | 8 (e.g. "2-3 business days", "24 hours" for questions the bot cannot know) |
+| Refusals escalated | 25 (empty "I'm unable to assist" answers; helpful "I can't see your order, but you can…" answers now pass) |
+| Answers no tier could fix (returned flagged, uncached) | 3 |
+| Intents moved up a tier by adaptive routing | 8: cancel_order, change_order, create_account, delivery_period, get_invoice, place_order, switch_account, track_order |
+| Answer quality, first vs second half of the run | 0.856 → **0.866** (routing learns which intents need a stronger tier) |
+| After the large tier was killed | Circuit breaker opened; medium and small absorbed its traffic with no errors |
+| Shadow cost vs always-Opus | $0.050 vs $0.504 (**90% lower**) |
 
-## Limits of this benchmark
-- **Answer quality was not scored.** The 0.5B–3B local models stand in for real tiers; their answers are often generic and sometimes invented (one claimed an order ETA it could not know). This run tests the gateway (caching, routing, budgets, failover), not the models. Judging quality needs a human review sample or an LLM judge.
-- Savings are dominated by **routing**: ~97% of support messages route to the small tier, which is ~40× cheaper than Opus at list prices. That is only a saving if the small model's answers are good enough for your users, which is the thing to validate on a reviewed sample before relying on it.
-- Shadow prices use list prices and, in the cache replay, an assumed 60-token reply; real bills depend on actual output lengths and any discounts.
-- Single dataset, single domain, English only. International phone formats such as `+44 20 7946 0958` are not yet detected as PII.
+### Effect of the refusal fix (same run, before → after)
+
+| | Before | After |
+|---|---|---|
+| Refusal escalations | 64 | 25 |
+| Answers no tier could fix | 20 | 3 |
+| Quality gain over the run | +0.002 | +0.010 |
+| Savings vs always-Opus | 86% | 90% |
+
+## Limits
+- **Reference similarity is an automatic proxy.** It rewards answers that resemble the human reply. It is no substitute for a human review sample or a strong LLM judge (`LLMJudgeValidator`) before production.
+- **The local 0.5B–3B models are much weaker than Claude.** These results show the gateway's mechanisms working; absolute answer quality on Claude models was not measured.
+- Shadow prices use list prices; cache-replay costs assume a 60-token reply.
+- One dataset, one domain, English only.
