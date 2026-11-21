@@ -75,13 +75,29 @@ def test_ledger_and_metrics_consistency_under_load():
     for t in tenants:
         billed = sum(r.cost_usd for tt, r in results if tt == t)
         assert gw.costs.spent(t) == pytest.approx(billed, abs=1e-9)
-    # Each (tenant, prompt) can miss more than once only if two threads raced on the very first
-    # request; total provider calls are bounded by distinct keys + concurrency.
+    # Request coalescing makes this exact, however the threads interleave: one model call
+    # per distinct (tenant, prompt); every other request is served from cache.
     distinct = len(set(work))
-    misses = len(work) - hits
-    assert distinct <= misses <= distinct + THREADS
-    # best achievable hit rate = every repeat of an already-seen pair is served from cache
-    assert hits >= len(work) - distinct - THREADS
+    assert len(work) - hits == distinct
+    assert gw.stats()["cache"]["stores"] == distinct
+
+
+def test_stampede_of_identical_requests_makes_one_model_call():
+    provider = MockProvider(latency=0.05)  # slow model widens the race window
+    gw = gateway(provider=provider)
+    with ThreadPoolExecutor(64) as ex:
+        results = list(ex.map(lambda _: gw.generate("What is the refund policy?"), range(64)))
+    assert provider.calls == ["small-a"]
+    assert sum(r.cache_hit for r in results) == 63
+    assert len({r.text for r in results}) == 1
+
+
+def test_coalescing_waiters_recover_when_leader_fails():
+    provider = MockProvider(latency=0.02, fail_times={"small-a": 2})  # leader's 2 tries fail
+    gw = gateway(provider=provider)
+    with ThreadPoolExecutor(16) as ex:
+        results = list(ex.map(lambda _: gw.generate("same question"), range(16)))
+    assert all(r.text for r in results)  # leader fell back to medium-a; waiters got its answer
 
 
 def test_cache_answers_never_cross_tenants_under_load():

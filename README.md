@@ -177,7 +177,7 @@ smartgate presets
 ## Testing
 
 ```bash
-pytest -q                                              # 102 tests, ~15 s, fully offline
+pytest -q                                              # 104 tests, ~15 s, fully offline
 SMARTGATE_FUZZ=3000 pytest tests/advanced/test_properties.py   # deeper fuzzing
 ```
 
@@ -185,7 +185,7 @@ SMARTGATE_FUZZ=3000 pytest tests/advanced/test_properties.py   # deeper fuzzing
 |---|---|
 | `tests/test_*.py` | Unit and end-to-end behaviour of every component and the HTTP server |
 | `advanced/test_properties.py` | Invariants for random inputs (hypothesis): complexity bounds, PII redaction completeness, tenant isolation, router chain validity, budget limits |
-| `advanced/test_concurrency.py` | 32 threads: the hard budget is never overspent, the ledger equals billed responses, no cross-tenant cache leaks |
+| `advanced/test_concurrency.py` | 32-64 threads: the hard budget is never overspent, the ledger equals billed responses, no cross-tenant cache leaks, exactly one model call per distinct prompt (request coalescing) |
 | `advanced/test_chaos.py` | Random provider failures, refusals, outages; circuit breaker opens and recovers; ≥97% availability under mixed chaos |
 | `advanced/test_quality.py` | Routing accuracy on a labeled set (87.5%, 0 severe misroutes), zero cache false hits on near-miss pairs, 82% cost savings vs. always-Opus. Writes `benchmark_report.json` |
 | `advanced/test_system.py` | HTTP under 40 concurrent clients, budget enforced over HTTP, SQLite cache shared across processes, lookup latency at 10k entries |
@@ -212,7 +212,7 @@ smartgate/
   providers/        Provider base, AnthropicProvider, CallableProvider, MockProvider
   config.py         dict/JSON/YAML config + industry presets
   server.py client.py cli.py observability.py
-tests/              102 tests: unit, e2e, HTTP, property-based, concurrency, chaos, quality benchmarks
+tests/              104 tests: unit, e2e, HTTP, property-based, concurrency, chaos, quality benchmarks
 ```
 
 ## License

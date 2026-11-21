@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import asyncio
+import threading
 import time
 import uuid
 from dataclasses import dataclass, field, replace
@@ -56,6 +57,7 @@ class Gateway:
         policy: Optional[PolicyConfig] = None,
         resilience: Optional[ResilienceConfig] = None,
         sleep=time.sleep,
+        coalesce_timeout: float = 300.0,
     ) -> None:
         missing = {m.provider for m in models} - set(providers)
         if missing:
@@ -72,6 +74,11 @@ class Gateway:
         self.events = EventBus()
         self.metrics = Metrics()
         self._sleep = sleep
+        # Request coalescing ("single-flight"): concurrent identical cacheable requests wait
+        # for the first one in flight instead of all calling the model (cache stampede).
+        self.coalesce_timeout = coalesce_timeout
+        self._inflight: Dict[str, threading.Event] = {}
+        self._inflight_lock = threading.Lock()
 
     # ----------------------------------------------------------- public API
     def on(self, event: str, hook) -> "Gateway":
@@ -168,6 +175,25 @@ class Gateway:
         return True
 
     def _generate(self, request: GatewayRequest, rid: str, started: float) -> GatewayResponse:
+        if not (request.use_cache and self.cache.config.enabled):
+            return self._generate_inner(request, rid, started)
+        key = (self.cache.namespace(request, request.model or "") + "|"
+               + self.cache.exact_key(request.last_user_message))
+        with self._inflight_lock:
+            leader_event = self._inflight.get(key)
+            if leader_event is None:
+                self._inflight[key] = threading.Event()
+        if leader_event is not None:
+            self.metrics.incr("coalesced")
+            leader_event.wait(self.coalesce_timeout)  # then served from cache (or computes itself)
+            return self._generate_inner(request, rid, started)
+        try:
+            return self._generate_inner(request, rid, started)
+        finally:
+            with self._inflight_lock:
+                self._inflight.pop(key).set()
+
+    def _generate_inner(self, request: GatewayRequest, rid: str, started: float) -> GatewayResponse:
         analysis = self.analyzer.analyze(request)
         request, analysis = self._apply_policy(request, analysis, rid)
         partition = request.model or ""
