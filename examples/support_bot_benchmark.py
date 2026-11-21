@@ -28,6 +28,7 @@ import statistics
 import threading
 import time
 from collections import Counter, defaultdict
+from dataclasses import replace
 
 from smartgate import (CacheConfig, CallableEmbedder, CallableProvider, Gateway, HashingEmbedder,
                        ModelSpec, PolicyConfig, ProviderError, ProviderResponse, SemanticCache, Usage,
@@ -82,10 +83,21 @@ def load(path: str, seed: int = 7, pii_rate: float = 0.05):
 class NomicEmbedder:
     """nomic-embed-text-v1.5 via llama.cpp; memoized so threshold sweeps embed each text once."""
 
-    def __init__(self, path: str):
+    def __init__(self, path: str, memo_path: str | None = None):
         from llama_cpp import Llama
         self.llm = Llama(model_path=path, embedding=True, n_ctx=512, n_threads=os.cpu_count(), verbose=False)
         self.memo, self.lock, self.dim = {}, threading.Lock(), 768
+        self.memo_path = memo_path
+        if memo_path and os.path.exists(memo_path):
+            import pickle
+            with open(memo_path, "rb") as f:
+                self.memo = pickle.load(f)
+
+    def save(self):
+        if self.memo_path:
+            import pickle
+            with open(self.memo_path, "wb") as f:
+                pickle.dump(self.memo, f)
 
     def embed(self, text: str):
         with self.lock:
@@ -112,7 +124,7 @@ def shadow_models(provider: str):
             for _, tier, pin, pout, claude in TIERS]
 
 
-def run_cache_replay(data, embedder, threshold, label):
+def run_cache_replay(data, embedder, threshold, label, base_config=None):
     intent_of = {}
     for d in data:
         intent_of.setdefault(d["text"], d["intent"])
@@ -126,8 +138,8 @@ def run_cache_replay(data, embedder, threshold, label):
 
     redact_map = {}
     gw = Gateway(models=shadow_models("standin"), providers={"standin": CallableProvider("standin", stand_in)},
-                 cache=SemanticCache(CacheConfig(similarity_threshold=threshold, ttl_seconds=None,
-                                                 max_entries=100_000),
+                 cache=SemanticCache(replace(base_config or CacheConfig(), similarity_threshold=threshold,
+                                             ttl_seconds=None, max_entries=100_000),
                                      embedder=embedder),
                  policy=PolicyConfig(pii="redact"))
     from smartgate.analysis import redact_pii
@@ -232,7 +244,9 @@ def run_live(data, models_dir, embedder, threshold, n, kill_at):
         baseline += (u_in * OPUS_IN + u_out * OPUS_OUT) / 1e6
         cost += r.cost_usd
         rows.append({"i": i, "model": "cache" if r.cache_hit else r.model, "latency_s": wall,
-                     "fallback": any(not a.ok for a in r.attempts), "after_kill": i >= kill_at,
+                     "fallback": any(not a.ok and not (a.error or "").startswith("quality:") for a in r.attempts),
+                     "escalated": any((a.error or "").startswith("quality:") for a in r.attempts),
+                     "quality_warning": r.quality_warning, "after_kill": i >= kill_at,
                      "intent": d["intent"], "q": d["text"], "a": r.text})
     hit_lat = [x["latency_s"] for x in rows if x["model"] == "cache"]
     miss_lat = [x["latency_s"] for x in rows if x["model"] != "cache"]
@@ -248,6 +262,8 @@ def run_live(data, models_dir, embedder, threshold, n, kill_at):
         "after_kill_large_tier_requests_rerouted": sum(1 for x in after if x["fallback"]),
         "after_kill_served_by": dict(Counter(x["model"] for x in after)),
         "circuit_breakers": gw.stats()["circuit_breakers"],
+        "quality_escalations": sum(1 for x in rows if x["escalated"]),
+        "answers_failing_all_tiers": sum(1 for x in rows if x["quality_warning"]),
         "shadow_cost_usd": round(cost, 5), "baseline_all_opus_no_cache_usd": round(baseline, 5),
         "savings_pct": round(100 * (1 - cost / baseline), 1) if baseline else None,
         "wall_clock_min": round((time.perf_counter() - t_start) / 60, 1),
@@ -256,39 +272,68 @@ def run_live(data, models_dir, embedder, threshold, n, kill_at):
     }
 
 
+def part_a(data, embedders, max_wrong_per_1000):
+    """Before/after on a train/test split: thresholds are chosen on train, reported on test."""
+    from smartgate import calibrate_threshold
+    half = len(data) // 2
+    train, test = data[:half], data[half:]
+    train_labeled = [(d["text"], d["intent"]) for d in train]
+    configs = {
+        "before (number+negation guards, preset threshold 0.90)": (CacheConfig(guard_actions=False), 0.90),
+        "after (+ action guard, threshold calibrated on train)": (CacheConfig(guard_actions=True), None),
+    }
+    out = []
+    for emb_name, emb in embedders.items():
+        for cfg_name, (cfg, fixed) in configs.items():
+            cal = calibrate_threshold(train_labeled, emb, max_wrong_per_1000=max_wrong_per_1000, base=cfg,
+                                      thresholds=(0.80, 0.83, 0.86, 0.88, 0.90, 0.92, 0.94, 0.96, 0.98))
+            th = fixed if fixed is not None else cal["threshold"]
+            res = run_cache_replay(test, emb, th, emb_name, base_config=cfg)
+            res["config"] = cfg_name
+            res["train_calibration"] = [{k: round(v, 4) if isinstance(v, float) else v for k, v in r.items()}
+                                        for r in cal["table"]]
+            out.append(res)
+            print(json.dumps({k: res[k] for k in ("embedder", "config", "threshold", "cache_hit_rate",
+                                                    "wrong_per_1000_requests", "hit_precision", "savings_pct",
+                                                    "pii_leaked_to_model")}), flush=True)
+    return out
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--data", required=True)
     ap.add_argument("--models-dir")
     ap.add_argument("--part", choices=["cache", "live", "all"], default="cache")
-    ap.add_argument("--live-n", type=int, default=300)
+    ap.add_argument("--live-n", type=int, default=200)
+    ap.add_argument("--max-wrong-per-1000", type=float, default=0.5,
+                    help="wrong-answer budget used to calibrate the threshold")
     ap.add_argument("--out", default="support_benchmark_results.json")
     args = ap.parse_args()
 
     data = load(args.data)
-    results = {"dataset_messages": len(data)}
+    results = {"dataset_messages": len(data), "split": "50% train (calibration) / 50% test (reported)"}
+    embedders = {"hashing (built-in)": MemoHashing()}
     nomic = None
-    if args.models_dir and os.path.exists(os.path.join(args.models_dir, "nomic-embed-text-v1.5.Q8_0.gguf")):
-        nomic = NomicEmbedder(os.path.join(args.models_dir, "nomic-embed-text-v1.5.Q8_0.gguf"))
+    npath = os.path.join(args.models_dir or "", "nomic-embed-text-v1.5.Q8_0.gguf")
+    if args.models_dir and os.path.exists(npath):
+        nomic = NomicEmbedder(npath, memo_path=os.path.join(args.models_dir, "nomic_memo.pkl"))
+        embedders["nomic-embed-text-v1.5"] = CallableEmbedder(nomic.embed, 768)
 
+    best = ("hashing (built-in)", 0.90)
     if args.part in ("cache", "all"):
-        runs = []
-        hashing = MemoHashing()
-        for th in (0.80, 0.86, 0.90, 0.95):
-            runs.append(run_cache_replay(data, hashing, th, "hashing (built-in)"))
-            print(json.dumps({k: runs[-1][k] for k in ("embedder", "threshold", "cache_hit_rate",
-                                                         "wrong_per_1000_requests", "savings_pct")}), flush=True)
+        results["cache_replay"] = part_a(data, embedders, args.max_wrong_per_1000)
         if nomic:
-            for th in (0.85, 0.90, 0.93, 0.95, 0.97):
-                runs.append(run_cache_replay(data, CallableEmbedder(nomic.embed, 768), th, "nomic-embed-text-v1.5"))
-                print(json.dumps({k: runs[-1][k] for k in ("embedder", "threshold", "cache_hit_rate",
-                                                             "wrong_per_1000_requests", "savings_pct")}), flush=True)
-        results["cache_replay"] = runs
+            nomic.save()
+        after = [r for r in results["cache_replay"] if r["config"].startswith("after")
+                 and r["wrong_per_1000_requests"] <= args.max_wrong_per_1000]
+        if after:
+            top = max(after, key=lambda r: r["cache_hit_rate"])
+            best = (top["embedder"], top["threshold"])
 
     if args.part in ("live", "all"):
-        emb = CallableEmbedder(nomic.embed, 768) if nomic else HashingEmbedder()
-        results["live"] = run_live(data, args.models_dir, emb, 0.95 if nomic else 0.90,
-                                   args.live_n, kill_at=args.live_n // 2)
+        emb = embedders[best[0]]
+        results["live"] = run_live(data, args.models_dir, emb, best[1], args.live_n, kill_at=args.live_n // 2)
+        results["live"]["cache_embedder"], results["live"]["cache_threshold"] = best
         print(json.dumps({k: v for k, v in results["live"].items() if k != "sample_answers"}, indent=1))
 
     with open(args.out, "w") as f:

@@ -12,7 +12,7 @@ EVENTS = (
     "request.start", "request.complete", "request.error",
     "cache.hit", "cache.miss", "cache.store",
     "route.decided", "provider.retry", "provider.error", "fallback",
-    "budget.downgrade", "budget.exceeded", "policy.redacted", "policy.blocked",
+    "budget.downgrade", "quality.escalate", "budget.exceeded", "policy.redacted", "policy.blocked",
 )
 
 Hook = Callable[[str, Dict[str, Any]], None]

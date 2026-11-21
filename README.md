@@ -66,6 +66,14 @@ Run without an API key: `python examples/quickstart.py`, which uses the offline 
 - **Context-safe keys:** an entry is only reused when the tenant, system prompt and prior conversation turns match, so an answer never leaks into a different conversation.
 - **Tenant isolation** by default (`scope="tenant"`); use `scope="global"` for shared public content such as product FAQs.
 - **TTL**, LRU size bounds, manual invalidation per tenant.
+- **Verification after retrieval:** a semantic match is served only if both questions agree on numbers ("order 5512" ≠ "order 5513"), negation ("safe" ≠ "not safe") and the requested action ("check my invoice" ≠ "send me my invoice", "edit" ≠ "delete"). Actions are grouped into synonym classes, so "change" still matches "modify". Add domain classes with `CacheConfig(extra_action_classes={...})`.
+- **Calibrate the threshold on your own traffic** instead of guessing:
+  ```python
+  from smartgate import calibrate_threshold
+  result = calibrate_threshold(labeled_queries, embedder, max_wrong_per_1000=0.5)  # [(text, label), ...]
+  result["threshold"], result["table"]   # best threshold within the wrong-answer budget, full sweep
+  ```
+- **Seed approved answers:** `gw.cache.seed("What is your return policy?", approved_text, tenant_id="shop", system=SYSTEM)`.
 - **Safety:** prompts containing PII or time-sensitive words ("today", "latest", "stock price") are not cached unless you opt in.
 - **Backends:** `InMemoryVectorStore`, `SQLiteVectorStore` (durable), or implement `VectorStore` for Redis, pgvector, Qdrant or Pinecone.
 - **Embeddings:** the built-in `HashingEmbedder` is deterministic and offline, and catches rephrasings and near-duplicates. For deeper paraphrase matching, plug in any neural model:
@@ -104,6 +112,7 @@ PromptAnalyzer(domain_keywords={"indemnif": 0.25},
 - **Retry** with exponential backoff, jitter, and `retry-after` support. Only transient errors are retried: rate limits, 5xx, timeouts and connection errors.
 - **Circuit breaker** per model (closed → open → half-open), so a failing model is skipped instantly.
 - **Fallback chain:** `same_tier_then_up` (the default: escalate for quality, then degrade for availability), `same_tier_then_down`, or `any`.
+- **Cascade on bad answers:** every answer passes a validator (default: empty, refusal-style or unfilled-template answers fail). A failed answer is billed but never cached, and the request escalates to the next tier up. If no tier passes, the last answer is returned with `quality_warning` set. Plug in your own check (an LLM judge, a schema check) with `Gateway(validator=fn)`, or pass `validator=None` to turn it off.
 - **Refusals** (`stop_reason == "refusal"`) fail over to the next model. Bad requests are raised immediately, because another model wouldn't fix them.
 
 ### 6. Policy and observability
@@ -183,7 +192,7 @@ smartgate presets
 ## Testing
 
 ```bash
-pytest -q                                              # 104 tests, ~15 s, fully offline
+pytest -q                                              # 113 tests, ~15 s, fully offline
 SMARTGATE_FUZZ=3000 pytest tests/advanced/test_properties.py   # deeper fuzzing
 ```
 
@@ -210,7 +219,8 @@ SMARTGATE_FUZZ=3000 pytest tests/advanced/test_properties.py   # deeper fuzzing
 smartgate/
   gateway.py        orchestrator (analysis → policy → cache → route → budget → call → record)
   analysis.py       complexity, task type, PII, cacheability
-  cache/            SemanticCache + InMemory/SQLite vector stores
+  cache/            SemanticCache, verification guards, calibration, InMemory/SQLite stores
+  quality.py        answer validator for cascade escalation
   embeddings.py     HashingEmbedder, CallableEmbedder
   routing.py        ModelRouter, RoutingRule, fallback ordering
   cost.py           Budget, CostController, SpendLedger
@@ -218,7 +228,7 @@ smartgate/
   providers/        Provider base, AnthropicProvider, CallableProvider, MockProvider
   config.py         dict/JSON/YAML config + industry presets
   server.py client.py cli.py observability.py
-tests/              104 tests: unit, e2e, HTTP, property-based, concurrency, chaos, quality benchmarks
+tests/              113 tests: unit, e2e, HTTP, property-based, concurrency, chaos, quality benchmarks
 ```
 
 ## License

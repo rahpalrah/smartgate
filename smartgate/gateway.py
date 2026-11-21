@@ -15,8 +15,9 @@ from .errors import (AllModelsFailedError, BudgetExceededError, ConfigError,
                      PolicyViolationError, ProviderError)
 from .observability import EventBus, Metrics
 from .providers.base import Provider
+from .quality import Validator, default_validator
 from .resilience import BreakerRegistry, RetryPolicy
-from .routing import ModelRouter, RoutingConfig, RoutingRule
+from .routing import ModelRouter, RoutingConfig, RoutingRule, tier_index
 from .types import Attempt, GatewayRequest, GatewayResponse, Message, Usage
 
 
@@ -58,6 +59,7 @@ class Gateway:
         resilience: Optional[ResilienceConfig] = None,
         sleep=time.sleep,
         coalesce_timeout: float = 300.0,
+        validator: Optional[Validator] = default_validator,
     ) -> None:
         missing = {m.provider for m in models} - set(providers)
         if missing:
@@ -77,6 +79,7 @@ class Gateway:
         # Request coalescing ("single-flight"): concurrent identical cacheable requests wait
         # for the first one in flight instead of all calling the model (cache stampede).
         self.coalesce_timeout = coalesce_timeout
+        self.validator = validator
         self._inflight: Dict[str, threading.Event] = {}
         self._inflight_lock = threading.Lock()
 
@@ -231,9 +234,14 @@ class Gateway:
         attempts: List[Attempt] = []
         tried = 0
         budget_skipped: Dict[str, float] = {}
+        floor = -1           # after a failed quality check, only strictly higher tiers are tried
+        spent = 0.0          # cost of escalated (rejected) answers is still billed
+        best_effort = None   # last rejected answer, returned if no higher tier can answer
         for model in decision.candidates:
             if tried >= self.resilience.max_models_tried:
                 break
+            if tier_index(model.tier) <= floor:
+                continue
             breaker = self.breakers.get(f"{model.provider}:{model.name}")
             if not breaker.allow():
                 attempts.append(Attempt(model.name, model.provider, False, "circuit open"))
@@ -271,22 +279,39 @@ class Gateway:
                 self.costs.release(token)
                 raise
             breaker.success()
-            attempts.append(Attempt(model.name, model.provider, True, None, _ms(t0)))
-            if any(not a.ok for a in attempts):
-                self.metrics.incr("fallbacks_used")
-                reason += f"; fell back to {model.name}"
-
             cost = model.cost(result.usage.input_tokens, result.usage.output_tokens)
             self.costs.settle(token, cost, model.name, result.usage.input_tokens, result.usage.output_tokens)
             self.metrics.incr(f"model.{model.name}")
+            spent += cost
+            problem = self.validator(request, result) if self.validator else None
+            if problem:
+                attempts.append(Attempt(model.name, model.provider, False, f"quality: {problem}", _ms(t0)))
+                self.metrics.incr("quality_escalations")
+                self.events.emit("quality.escalate", {"request_id": rid, "model": model.name, "reason": problem})
+                floor = tier_index(model.tier)
+                best_effort = (model, result, problem)
+                reason += f"; {model.name} answer rejected ({problem}), escalating"
+                continue
+            attempts.append(Attempt(model.name, model.provider, True, None, _ms(t0)))
+            if any(not a.ok and not (a.error or "").startswith("quality:") for a in attempts):
+                self.metrics.incr("fallbacks_used")
+                reason += f"; fell back to {model.name}"
             if cacheable and result.stop_reason in (None, "end_turn", "stop_sequence"):
                 if self.cache.store_response(request, result.text, model.name, cost,
                                              result.usage.input_tokens, result.usage.output_tokens, partition):
                     self.events.emit("cache.store", {"request_id": rid})
             return GatewayResponse(
                 text=result.text, model=model.name, provider=model.provider, usage=result.usage,
-                cost_usd=cost, route_reason=reason, analysis=analysis.to_dict(),
+                cost_usd=spent, route_reason=reason, analysis=analysis.to_dict(),
                 attempts=attempts, latency_ms=_ms(started), request_id=rid)
+
+        if best_effort:  # nothing above could do better: return it, flagged and uncached
+            model, result, problem = best_effort
+            return GatewayResponse(
+                text=result.text, model=model.name, provider=model.provider, usage=result.usage,
+                cost_usd=spent, route_reason=reason + "; no higher tier available",
+                analysis=analysis.to_dict(), attempts=attempts, latency_ms=_ms(started),
+                request_id=rid, quality_warning=problem)
 
         if budget_skipped and not any(a.error and a.error != "circuit open" for a in attempts):
             budget = self.costs.budget_for(request.tenant_id)

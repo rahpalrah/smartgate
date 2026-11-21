@@ -137,6 +137,7 @@ class GatewayResponse:
     attempts: List[Attempt] = field(default_factory=list)
     latency_ms: float = 0.0
     request_id: str = ""
+    quality_warning: Optional[str] = None  # set when no model passed validation
 
     def to_dict(self) -> Dict[str, Any]:
         return asdict(self)
