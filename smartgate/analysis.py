@@ -19,7 +19,10 @@ PII_PATTERNS: Dict[str, re.Pattern] = {
     "iban": re.compile(r"\b[A-Z]{2}\d{2}[A-Z0-9]{11,30}\b"),
     "mrn": re.compile(r"\b(?:MRN|medical record(?: number)?)[:#\s]*\d{5,}\b", re.I),
     "ip_address": re.compile(r"\b(?:\d{1,3}\.){3}\d{1,3}\b"),
-    "phone": re.compile(r"(?<!\d)(?:\+?\d{1,3}[\s.-]?)?(?:\(\d{3}\)|\d{3})[\s.-]?\d{3}[\s.-]?\d{4}(?!\d)"),
+    # Separators, parentheses or a leading "+" are required: bare digit runs are order,
+    # invoice or tracking numbers far more often than phone numbers.
+    "phone": re.compile(r"(?<![\w+])(?:\+\d{1,3}[\s.-]?)?(?:\(\d{3}\)\s?|\d{3}[\s.-])\d{3}[\s.-]\d{4}(?!\d)"
+                        r"|\+\d{10,14}\b"),
 }
 # Maximal runs of digits joined by single spaces/dashes; card numbers are searched inside them.
 _DIGIT_RUN = re.compile(r"\d(?:[ -]?\d)*")

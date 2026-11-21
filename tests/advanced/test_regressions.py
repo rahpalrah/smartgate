@@ -46,3 +46,11 @@ def test_pure_python_fallback_index(no_numpy):
     assert c.lookup(req("Question about topic 79?")).entry.response == "a79"
     assert c.lookup(req("question about topic 0")) is None  # evicted (LRU)
     assert c.invalidate("default") == 50 and c.store.size() == 0
+
+
+def test_bug4_bare_order_numbers_are_not_phones():
+    # found by the Bitext real-data benchmark: order numbers were redacted as phone numbers
+    for text in ("update purchase732201349959", "order 00004587345", "invoice 5551234567"):
+        assert "phone" not in detect_pii(text)
+    for text in ("call 555-867-5309", "(212) 555-0100", "+14155550123"):
+        assert "phone" in detect_pii(text)
