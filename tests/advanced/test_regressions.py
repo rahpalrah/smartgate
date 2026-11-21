@@ -54,3 +54,26 @@ def test_bug4_bare_order_numbers_are_not_phones():
         assert "phone" not in detect_pii(text)
     for text in ("call 555-867-5309", "(212) 555-0100", "+14155550123"):
         assert "phone" in detect_pii(text)
+
+
+def test_bug5_symbols_that_change_meaning_are_not_collapsed():
+    # found by the Quora benchmark: normalization stripped "+", "#", "-" so these were identical,
+    # e.g. a cached answer about O- blood donors was served for O+ (and C vs C++, Nike vs Nike+)
+    pairs = [("Is the O- blood group the universal donor?", "Is the O+ blood group the universal donor?"),
+             ("How do I write a simple code in C for SJF scheduling?", "How do I write a simple code in C++ for SJF scheduling?"),
+             ("What is your review of Nike+?", "What is your review of Nike?"),
+             ("What is the difference between () and [] in Python?", "What is the difference between /= and //= in Python?")]
+    for a, b in pairs:
+        assert SemanticCache.exact_key(a) != SemanticCache.exact_key(b), (a, b)
+        c = SemanticCache(CacheConfig(similarity_threshold=0.5))
+        c.store_response(req(a), "answer", "m")
+        assert c.lookup(req(b)) is None, (a, b)
+
+
+def test_symbol_guard_keeps_harmless_formatting_matching():
+    k = SemanticCache.exact_key
+    assert k("is it dishwasher-safe?") == k("is it dishwasher safe")
+    assert k("Hushed (app) phone number") == k("hushed(app) phone number")
+    assert k("How do I overcome my inferiority complex ?") == k("How do I overcome my inferiority complex?")
+    c = SemanticCache(CacheConfig(similarity_threshold=0.5))
+    assert c.signature("track my order (urgent)")[3] == c.signature("track my order")[3]

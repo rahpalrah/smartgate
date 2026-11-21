@@ -24,6 +24,26 @@ from ..types import GatewayRequest, Message
 from .store import CacheEntry, InMemoryVectorStore, VectorStore
 
 _NUM = re.compile(r"\d+(?:[.,]\d+)*")
+# Symbols that change meaning: "O-" vs "O+", "C" vs "C++", "Nike+" vs "Nike", "/=" vs "//=".
+# normalize_text() strips punctuation so these would otherwise look identical. Always counted:
+# + # = % & * < > | \\ ^ ~ and brackets; - and / only when not word-internal ("dishwasher-safe"
+# is fine, "O-" is not). Brackets that wrap words ("(preemptive)") are ignored; "()" and "[]" count.
+_SYM_ALWAYS = frozenset("+#=%&*<>|\\^~()[]{}")
+_WRAPPED = re.compile(r"[(\[{][^)\]}]*[A-Za-z0-9][^)\]}]*[)\]}]")
+
+
+def symbol_signature(text: str) -> str:
+    text = _WRAPPED.sub(" ", text)
+    n, syms = len(text), []
+    for i, ch in enumerate(text):
+        if ch in _SYM_ALWAYS:
+            syms.append(ch)
+        elif ch in "-/":
+            prev = text[i - 1] if i else " "
+            nxt = text[i + 1] if i + 1 < n else " "
+            if not (prev.isalnum() and nxt.isalnum()):
+                syms.append(ch)
+    return "".join(sorted(syms))
 _NEG = re.compile(r"\b(not|no|never|none|nor|without|cannot|neither|nothing|nobody|nowhere|"
                   r"isn|aren|wasn|weren|doesn|didn|won|wouldn|shouldn|couldn|can t|don)\b")
 
@@ -91,7 +111,8 @@ def _compile_actions(classes: Dict[str, Sequence[str]]):
     return compiled, typos
 
 
-def guard_signature(text: str, numbers: bool = True, negation: bool = True, actions=None) -> tuple:
+def guard_signature(text: str, numbers: bool = True, negation: bool = True, actions=None,
+                    symbols: bool = False) -> tuple:
     norm = normalize_text(text)
     if actions:
         compiled, typos = actions
@@ -100,7 +121,7 @@ def guard_signature(text: str, numbers: bool = True, negation: bool = True, acti
     nums = tuple(sorted(n.replace(",", "") for n in _NUM.findall(text))) if numbers else ()
     negs = len(_NEG.findall(norm)) % 2 if negation else 0
     acts: FrozenSet[str] = frozenset(n for n, rx in actions if rx.search(norm)) if actions else frozenset()
-    return nums, negs, acts
+    return nums, negs, acts, symbol_signature(text) if symbols else ""
 
 
 @dataclass
@@ -116,6 +137,7 @@ class CacheConfig:
     guard_numbers: bool = True
     guard_negation: bool = True
     guard_actions: bool = True
+    guard_symbols: bool = True
     action_classes: Optional[Dict[str, List[str]]] = None  # None = DEFAULT_ACTION_CLASSES
     extra_action_classes: Dict[str, List[str]] = field(default_factory=dict)  # merged on top
     search_top_k: int = 5
@@ -153,11 +175,12 @@ class SemanticCache:
 
     @staticmethod
     def exact_key(text: str) -> str:
-        return hashlib.sha256(normalize_text(text).encode()).hexdigest()
+        # Normalized text + meaning-bearing symbols, so "O-" and "O+" never collide.
+        return hashlib.sha256((normalize_text(text) + "\0" + symbol_signature(text)).encode()).hexdigest()
 
     def signature(self, text: str) -> tuple:
         cfg = self.config
-        return guard_signature(text, cfg.guard_numbers, cfg.guard_negation, self._actions)
+        return guard_signature(text, cfg.guard_numbers, cfg.guard_negation, self._actions, cfg.guard_symbols)
 
     def _bump(self, key: str) -> None:
         with self._lock:

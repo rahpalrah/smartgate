@@ -45,10 +45,11 @@ sb.SYSTEM = SYSTEM  # the shared live-run helpers read this module global
 
 
 # ================================================================================ QUORA
-GUARD_CONFIGS = {
-    "no guards": dict(guard_numbers=False, guard_negation=False, guard_actions=False),
-    "numbers + negation": dict(guard_numbers=True, guard_negation=True, guard_actions=False),
-    "all guards (+ actions)": dict(guard_numbers=True, guard_negation=True, guard_actions=True),
+GUARD_CONFIGS = {  # cumulative layers; "legacy" exact matching = text normalization only
+    "no guards (legacy exact match)": dict(guard_numbers=False, guard_negation=False, guard_actions=False, guard_symbols=False),
+    "+ numbers + negation": dict(guard_numbers=True, guard_negation=True, guard_actions=False, guard_symbols=False),
+    "+ actions": dict(guard_numbers=True, guard_negation=True, guard_actions=True, guard_symbols=False),
+    "+ symbols (final)": dict(guard_numbers=True, guard_negation=True, guard_actions=True, guard_symbols=True),
 }
 GRID = np.round(np.arange(0.60, 1.0001, 0.01), 2)
 
@@ -69,9 +70,15 @@ def quora_part(path, n_pairs, embedders, target_precision):
     half = len(rows) // 2
     y = np.array([int(r["is_duplicate"]) for r in rows])
     train, test = slice(0, half), slice(half, None)
-    exact = np.array([SemanticCache.exact_key(r["question1"]) == SemanticCache.exact_key(r["question2"]) for r in rows])
+    from smartgate.embeddings import normalize_text
+    exact_legacy = np.array([normalize_text(r["question1"]) == normalize_text(r["question2"]) for r in rows])
+    exact_new = np.array([SemanticCache.exact_key(r["question1"]) == SemanticCache.exact_key(r["question2"]) for r in rows])
+    out_exact = {"pairs_identical_after_normalization": int(exact_legacy.sum()),
+                 "of_which_labeled_duplicate": int((exact_legacy & (y == 1)).sum()),
+                 "now_kept_apart_by_symbol_check": int((exact_legacy & ~exact_new).sum()),
+                 "of_those_labeled_not_duplicate": int((exact_legacy & ~exact_new & (y == 0)).sum())}
     out = {"pairs": len(rows), "duplicate_share": round(float(y.mean()), 3), "target_precision_on_train": target_precision,
-           "rows": [], "lookup_path_selfcheck": None}
+           "rows": [], "lookup_path_selfcheck": None, "exact_match_check": out_exact}
     chosen = {}
     for emb_name, emb in embedders.items():
         t0 = time.perf_counter()
@@ -83,7 +90,9 @@ def quora_part(path, n_pairs, embedders, target_precision):
             cache = SemanticCache(CacheConfig(**g), embedder=emb)
             ok = np.array([cache.signature(r["question1"]) == cache.signature(r["question2"]) for r in rows])
 
-            def serve(th):
+            exact = exact_new if g["guard_symbols"] else exact_legacy
+
+            def serve(th, exact=exact, ok=ok):
                 return exact | ((sims >= th) & ok)
             cal = []
             for th in GRID:
@@ -99,11 +108,11 @@ def quora_part(path, n_pairs, embedders, target_precision):
                    "guard_blocked_false_duplicates_test": int((~ok[test] & (y[test] == 0)).sum())}
             out["rows"].append(row)
             print(json.dumps({k: row[k] for k in ("embedder", "guards", "at_precision_target")}), flush=True)
-            if g_name.startswith("all"):
-                chosen[emb_name] = (th_prec, cache, serve(th_prec))
+            if g_name.startswith("+ symbols"):
+                chosen[emb_name] = (th_f1, cache, serve(th_f1))
     # the pairwise numbers above must equal what the real SemanticCache.lookup() path does
     emb_name = list(embedders)[0]
-    th, cache, decisions = chosen[emb_name]
+    th, cache, decisions = chosen[emb_name]  # checked at the best-F1 threshold (a realistic one)
     cache = SemanticCache(CacheConfig(similarity_threshold=th, ttl_seconds=None), embedder=embedders[emb_name])
     idx = rnd.sample(range(half, len(rows)), min(400, len(rows) - half))
     agree = 0
