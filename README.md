@@ -3,7 +3,7 @@
 A drop-in layer between your applications and LLMs that **answers repeat questions from a semantic cache**, **sends each prompt to the cheapest model that can handle it**, **enforces per-tenant budgets**, and **fails over automatically** when a model is down or refuses.
 
 - **Zero-dependency core** (Python stdlib). `anthropic` and `pyyaml` are optional extras.
-- **Two ways to use it:** embed as a Python library, or run it as an HTTP service any language can call (Python and TypeScript clients included).
+- **Two ways to use it:** embed as a Python library, or run it as an HTTP service any language can call over plain HTTP + JSON (Python client included).
 - **Industry presets:** healthcare, finance, e-commerce, customer support, legal, education and SaaS/devtools, all overridable.
 - **Pluggable everywhere:** providers, embedders, vector stores, spend ledgers, analyzers, routing rules and event hooks.
 
@@ -165,7 +165,13 @@ curl -s localhost:8080/v1/generate -H "Authorization: Bearer key-acme" \
 
 When API keys are configured, the tenant always comes from the key and never from the request body, so one tenant can't spend another's budget. Error codes: `401` unauthorized, `402` budget exceeded, `422` policy violation, `503` all models failed.
 
-Clients: `smartgate.client.GatewayClient` (Python) and [`clients/typescript/smartgate.ts`](clients/typescript/smartgate.ts) (Node, browser, Deno, Bun).
+Python client:
+```python
+from smartgate.client import GatewayClient
+client = GatewayClient("http://localhost:8080", api_key="key-acme")
+print(client.generate("Where is my order?")["text"])
+```
+Services in other languages call the same endpoints with any HTTP library.
 
 ## CLI
 ```bash
