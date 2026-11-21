@@ -189,6 +189,10 @@ smartgate --preset healthcare ask "What are common symptoms of anemia?"
 smartgate presets
 ```
 
+## Benchmark on real data
+
+On 26,872 real-style support messages (Bitext dataset), with thresholds calibrated on one half and results reported on the other: **26% of requests served from cache with 0.07 wrong answers per 1,000**, PII never reaching a model, 0 failed requests when a model was killed mid-run, and ~90% lower cost than sending everything to Opus. Full method, numbers and limits: [docs/BENCHMARK.md](docs/BENCHMARK.md).
+
 ## Testing
 
 ```bash
