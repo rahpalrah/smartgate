@@ -413,6 +413,9 @@ def main():
     ap.add_argument("--part", choices=["cache", "live", "all"], default="cache")
     ap.add_argument("--live-n", type=int, default=400)
     ap.add_argument("--probe-n", type=int, default=60)
+    ap.add_argument("--cache-embedder", default="nomic-embed-text-v1.5",
+                    help="with --part live: embedder for the cache (normally chosen by part A)")
+    ap.add_argument("--cache-threshold", type=float, default=0.98)
     ap.add_argument("--max-wrong-per-1000", type=float, default=0.5,
                     help="wrong-answer budget used to calibrate the threshold")
     ap.add_argument("--out", default="support_benchmark_results.json")
@@ -427,7 +430,8 @@ def main():
         nomic = NomicEmbedder(npath, memo_path=os.path.join(args.models_dir, "nomic_memo.pkl"))
         embedders["nomic-embed-text-v1.5"] = CallableEmbedder(nomic.embed, 768)
 
-    best = ("hashing (built-in)", 0.90)
+    best = (args.cache_embedder if args.cache_embedder in embedders else "hashing (built-in)",
+            args.cache_threshold)
     if args.part in ("cache", "all"):
         results["cache_replay"] = part_a(data, embedders, args.max_wrong_per_1000)
         if nomic:

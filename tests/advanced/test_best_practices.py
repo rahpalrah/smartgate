@@ -210,3 +210,15 @@ class TestAdaptiveRouting:
                 gw.feedback(r.request_id, 0.0)  # thumbs-down on every small-tier answer
         assert served[-1] == "medium-a" and "small-a" in served
         assert not gw.feedback("unknown-id", 1.0)
+
+
+@pytest.mark.parametrize("answer,flagged", [
+    ("I'm sorry, but I'm unable to assist with that. If you have any other questions, please let me know.", True),
+    ("I'm sorry, but I don't have the ability to update orders. However, I can assist you with any other questions.", True),
+    ("I don't have access to your order details, but you can track it from the link in your confirmation email.", False),
+    ("I'm unable to cancel it myself. Please contact our support team at the Help page.", False),
+])
+def test_honest_limit_with_next_step_is_not_a_refusal(answer, flagged):
+    # found by the round-3 benchmark: helpful redirects were being escalated as refusals
+    r = ProviderResponse(answer, "m", Usage(1, 1), "end_turn")
+    assert (default_validator(req("where is my order?"), r) is not None) is flagged

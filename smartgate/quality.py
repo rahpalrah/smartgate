@@ -18,6 +18,15 @@ _REFUSAL = re.compile(
     r"(?:help|assist|answer|provide|do that|comply)|as an ai\b|i don'?t have (?:access|the ability))",
     re.I)
 _TEMPLATE_LEFTOVER = re.compile(r"\{\{[^}]{1,40}\}\}")
+# An honest limit plus a next step ("I can't see your order, but you can track it from the
+# confirmation email") is a good answer, not a refusal. Generic filler doesn't count.
+_ACTIONABLE = re.compile(
+    r"\b(you can|you may|you could|please (?:check|visit|contact|log ?in|sign ?in|go|use|reach|call|email|"
+    r"refer|look|follow|provide|share|send)|visit|go to|navigate|click|tap|log ?in|sign ?in|contact|"
+    r"reach out|call us|email us|follow (?:the|these)|check (?:your|the)|refer to|try (?:to|again))\b", re.I)
+_FILLER = re.compile(r"if you have any (?:other )?(?:questions|concerns)[^.!?]*[.!?]?|"
+                     r"(?:feel free to|don't hesitate to) (?:ask|reach out)[^.!?]*[.!?]?|"
+                     r"(?:i can|i'm happy to|happy to) (?:assist|help) (?:you )?with (?:any )?other[^.!?]*[.!?]?", re.I)
 
 
 def default_validator(request: GatewayRequest, response: ProviderResponse) -> Optional[str]:
@@ -25,7 +34,7 @@ def default_validator(request: GatewayRequest, response: ProviderResponse) -> Op
     text = (response.text or "").strip()
     if not text:
         return "empty response"
-    if _REFUSAL.search(text[:400]):
+    if _REFUSAL.search(text[:400]) and not _ACTIONABLE.search(_FILLER.sub(" ", text)):
         return "refusal-style answer"
     if _TEMPLATE_LEFTOVER.search(text):
         return "unfilled template placeholder"
