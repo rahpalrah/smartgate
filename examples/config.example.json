@@ -1,0 +1,29 @@
+{
+  "preset": "customer_support",
+  "cache": {
+    "similarity_threshold": 0.9,
+    "ttl_seconds": 43200,
+    "scope": "tenant"
+  },
+  "cache_store": { "type": "sqlite", "path": "smartgate_cache.db" },
+  "routing": {
+    "small_max": 0.4,
+    "medium_max": 0.72,
+    "fallback_strategy": "same_tier_then_up"
+  },
+  "policy": { "pii": "redact", "max_input_tokens": 200000, "blocked_terms": [] },
+  "default_budget": { "limit_usd": 50, "period": "monthly", "downgrade_at": 0.8 },
+  "budgets": {
+    "enterprise-co": { "limit_usd": 5000, "period": "monthly", "hard_limit": false }
+  },
+  "resilience": {
+    "retry": { "max_attempts": 3, "base_delay": 0.5, "max_delay": 8 },
+    "max_models_tried": 3,
+    "breaker_failure_threshold": 5,
+    "breaker_recovery_seconds": 30
+  },
+  "rules": [
+    { "name": "gold-tenants", "tenants": ["enterprise-co"], "min_tier": "medium" },
+    { "name": "code", "task_types": ["code"], "min_tier": "medium" }
+  ]
+}

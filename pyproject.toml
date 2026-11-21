@@ -1,0 +1,27 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "smartgate"
+version = "0.1.0"
+description = "Semantic cache & model routing gateway SDK: prompt analysis, complexity-based model selection, cost controls and fallbacks."
+readme = "README.md"
+requires-python = ">=3.9"
+license = { text = "Apache-2.0" }
+dependencies = []  # core is stdlib-only
+
+[project.optional-dependencies]
+anthropic = ["anthropic"]
+yaml = ["pyyaml"]
+fast = ["numpy"]
+dev = ["pytest", "hypothesis"]
+
+[project.urls]
+Homepage = "https://github.com/rahpalrah/smartgate"
+
+[project.scripts]
+smartgate = "smartgate.cli:main"
+
+[tool.setuptools.packages.find]
+include = ["smartgate*"]
