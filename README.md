@@ -250,4 +250,4 @@ tests/              141 tests: unit, e2e, HTTP, property-based, concurrency, cha
 
 ## License
 
-Apache License 2.0 — see [LICENSE](LICENSE).
+MIT License — see [LICENSE](LICENSE).

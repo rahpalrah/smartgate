@@ -8,7 +8,7 @@ version = "0.1.0"
 description = "Semantic cache & model routing gateway SDK: prompt analysis, complexity-based model selection, cost controls and fallbacks."
 readme = "README.md"
 requires-python = ">=3.10"
-license = { text = "Apache-2.0" }
+license = { text = "MIT" }
 dependencies = []  # core is stdlib-only
 
 [project.optional-dependencies]
