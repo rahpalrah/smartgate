@@ -17,6 +17,8 @@ request ─► Prompt analysis ─► Policy (PII redact/block) ─► Semantic 
      Provider call ─► retry w/ backoff ─► circuit breaker ─► fallback chain ─► record cost ─► cache store
 ```
 
+*Integrating into an existing system? Jump to [Integrate into your code](#integrate-into-your-code).*
+
 ## Install
 
 From GitHub:
@@ -59,6 +61,230 @@ gw.stats()                                          # hit rate, spend, savings, 
 ```
 
 Run without an API key: `python examples/quickstart.py`, which uses the offline `MockProvider`. Add `--live` to call Claude.
+
+## Integrate into your code
+
+This section is for engineers adding smartgate to an existing application. Pick the pattern that fits your system, then follow the "lines to change" for it.
+
+### Step 0 — decide where it runs
+
+| Your situation | Use | Why |
+|---|---|---|
+| One Python service calls an LLM | **Library**, in-process (patterns A–C below) | Fewest moving parts, no extra network hop |
+| Several services, or services in Java / Go / Node / .NET / PHP | **Shared HTTP service** (pattern D) | One cache, one budget ledger, any language |
+| Many replicas of a Python service | Library **plus** shared storage (pattern E) | Replicas must share the cache and the spend ledger |
+
+```
+In-process library                    Shared service (any language)
+
+ your app ──► smartgate ──► LLM        app 1 ─┐
+              (cache, routing,         app 2 ─┼─HTTP─► smartgate serve ──► LLMs
+               budgets, fallback)      app 3 ─┘        (one cache, one ledger)
+```
+
+**What it handles today:** text in, text out (single prompt or a multi-turn message list, plus a system prompt).
+**What it does not handle yet:** streaming responses, tool/function calls, and image or PDF inputs. Keep those calls on your existing client and route only plain-text requests through the gateway.
+
+---
+
+### Pattern A — replace a direct Anthropic SDK call (Python)
+
+Before:
+```python
+import anthropic                                                        # line 1
+client = anthropic.Anthropic()                                          # line 2
+
+resp = client.messages.create(                                          # line 3
+    model="claude-opus-5-5",                                            # line 4
+    max_tokens=1024,
+    system="You are a support bot.",
+    messages=history,                                                   # [{"role": "user"|"assistant", "content": "..."}]
+)
+answer = resp.content[0].text                                           # line 5
+```
+
+After:
+```python
+from smartgate import gateway_from_preset                               # line 1  (replaces the import)
+gw = gateway_from_preset("customer_support")                            # line 2  (create ONCE at startup, reuse everywhere)
+
+r = gw.generate(                                                        # line 3
+    history,                                                            #         same message list you already build
+    system="You are a support bot.",                                    #         same system prompt
+    tenant_id=current_customer_id,                                      # NEW: who is asking (see "Choosing tenant_id")
+    max_tokens=1024,
+)                                                                       # line 4: delete `model=`; the router picks it
+answer = r.text                                                         # line 5
+```
+
+| Line | Change |
+|---|---|
+| 1–2 | Swap the SDK import and client for one gateway object. Build it **once** (module level or app startup); it is thread-safe. |
+| 3 | `client.messages.create(...)` becomes `gw.generate(messages, ...)`. The messages list is passed positionally. |
+| 4 | **Delete `model=`.** The router chooses the model per request. To pin one anyway: `model="claude-sonnet-5-5"` (exact model) or `tier="large"`. |
+| new | Add `tenant_id=` so each customer gets an isolated cache and its own budget. |
+| 5 | `resp.content[0].text` becomes `r.text`. |
+
+Also available on the result: `r.model`, `r.cost_usd`, `r.cache_hit`, `r.saved_usd`, `r.usage`, `r.route_reason`, `r.request_id`, `r.quality_warning`.
+Credentials are unchanged: the Claude provider reads `ANTHROPIC_API_KEY` (or an `ant auth login` profile) exactly like the SDK.
+
+### Pattern B — web backend (FastAPI shown; Flask and Django are the same idea)
+
+```python
+from fastapi import FastAPI, HTTPException
+from smartgate import (AllModelsFailedError, Budget, BudgetExceededError,
+                       PolicyViolationError, gateway_from_preset)
+
+gw = gateway_from_preset("ecommerce")          # module level: created once per process
+app = FastAPI()
+
+@app.post("/support/ask")
+async def ask(body: dict):
+    try:
+        r = await gw.agenerate(                # agenerate = async wrapper; use generate() in sync code
+            body["question"],
+            system="You are a support bot.",
+            tenant_id=body["customer_id"],
+            max_tokens=400,
+        )
+    except BudgetExceededError:
+        raise HTTPException(402, "AI budget exhausted for this customer")
+    except PolicyViolationError as e:
+        raise HTTPException(422, f"Blocked by policy: {e.findings}")
+    except AllModelsFailedError:
+        raise HTTPException(503, "AI temporarily unavailable")
+    return {"answer": r.text, "cached": r.cache_hit, "model": r.model}
+```
+Lines to change in your handler: the line that calls the LLM, and the `except` block (map the three errors above to your own error responses). Everything else stays.
+
+### Pattern C — bring your own models (any vendor, any in-house model)
+
+1. **List your models** with their tier and price (USD per million tokens). This is the only place model names and prices live:
+```python
+from smartgate import Gateway, ModelSpec, CallableProvider
+from smartgate.providers import AnthropicProvider
+
+models = [
+    ModelSpec("my-small-model", "inhouse",   "small",  0.0,  0.0,  max_context_tokens=8_000),
+    ModelSpec("claude-sonnet-5-5", "anthropic", "medium", 2.0, 10.0, max_context_tokens=1_000_000),
+    ModelSpec("claude-opus-5-5",   "anthropic", "large",  4.0, 20.0, max_context_tokens=1_000_000),
+]
+```
+2. **Write one function per non-Claude provider.** It receives the chosen `ModelSpec` and the request and returns the reply text:
+```python
+def call_inhouse(model, request):
+    # request.messages = [Message(role, content), ...]; request.system = str | None; request.max_tokens = int
+    return my_http_client.post("https://llm.internal/v1/chat", json={
+        "model": model.name, "system": request.system,
+        "messages": [{"role": m.role, "content": m.content} for m in request.messages],
+        "max_tokens": request.max_tokens}).json()["text"]
+```
+3. **Register them:**
+```python
+gw = Gateway(models=models, providers={
+    "inhouse": CallableProvider("inhouse", call_inhouse),
+    "anthropic": AnthropicProvider(),                       # or AnthropicProvider(client=<Bedrock/Vertex client>)
+})
+```
+For token counts, cost and error handling, return a `ProviderResponse` and raise `ProviderError(retryable=..., fallback=...)` instead (see "Bring your own models / providers" below). The `provider` string in each `ModelSpec` must match a key in `providers=`.
+
+If you only use the default Claude catalog, the model names and prices in `DEFAULT_MODELS` (`smartgate/config.py`) are what the presets use; override them with a `"models": [...]` list in your config.
+
+### Pattern D — call it from any other language over HTTP
+
+Start the service once (any host that can reach your LLM provider):
+```bash
+export ANTHROPIC_API_KEY=...
+smartgate --preset customer_support serve --host 0.0.0.0 --port 8080 \
+  --api-keys '{"key-web":"storefront","key-mobile":"mobile-app"}' --admin-keys key-ops
+```
+Each API key maps to one tenant, and the server takes the tenant **from the key, never from the request body**, so one client cannot spend another's budget.
+
+Then replace your LLM call with an HTTP call:
+```bash
+curl -s http://smartgate.internal:8080/v1/generate \
+  -H "Authorization: Bearer key-web" -H "Content-Type: application/json" \
+  -d '{"messages":[{"role":"user","content":"Where is my order?"}],"system":"You are a support bot.","max_tokens":300}'
+```
+```js
+// Node 18+; the same shape works from Java, Go, C#, PHP, Ruby...
+const res = await fetch("http://smartgate.internal:8080/v1/generate", {
+  method: "POST",
+  headers: { "Authorization": "Bearer key-web", "Content-Type": "application/json" },
+  body: JSON.stringify({ messages: history, system: SYSTEM_PROMPT, max_tokens: 300 }),
+});
+const out = await res.json();           // out.text, out.model, out.cost_usd, out.cache_hit
+if (res.status === 402) { /* budget exhausted */ }
+```
+
+| Lines to change in the calling code | |
+|---|---|
+| The URL | your provider's endpoint becomes `http(s)://<smartgate-host>/v1/generate` |
+| The auth header | your provider key becomes the **smartgate API key** (`Authorization: Bearer ...`); the provider key now lives only on the server |
+| The request body | `{"messages": [...], "system": "...", "max_tokens": N}`; optional: `tier`, `model`, `use_cache`, `tags`, `metadata` |
+| The response parse | read `text` (also `model`, `cost_usd`, `cache_hit`, `route_reason`) |
+| Error handling | `402` budget exhausted · `422` blocked by policy · `503` all models failed · `401` bad key · `400` bad request |
+
+Other endpoints: `POST /v1/analyze` (dry run: which model and what cost, without calling one), `GET /v1/stats`, `GET /v1/costs`, `POST /v1/cache/invalidate`, `GET /health` (use for load-balancer checks).
+There is a Python client too: `from smartgate.client import GatewayClient`.
+
+### Pattern E — more than one replica or process
+
+By default the cache and the spend ledger live in one process's memory. With several replicas, each would keep its own cache and its own budget, so a "$100 limit" could be spent once per replica. Choose one:
+
+| Option | Change |
+|---|---|
+| **Run it as one shared service** (pattern D) | Nothing else to do: all clients share one cache and ledger. Simplest. |
+| **Shared cache file on one host** | In config: `"cache_store": {"type": "sqlite", "path": "/var/lib/smartgate/cache.db"}` (several processes on the same machine can share it) |
+| **Redis / Postgres / pgvector across hosts** | Implement the two small interfaces and pass them in: `VectorStore` (`smartgate/cache/store.py`) for the cache, `SpendLedger` (`smartgate/cost.py`) for settled spend. **Caveat:** the in-flight reservation that makes a hard budget exact is held in each process's memory, so with several replicas a limit can be exceeded by up to the worst-case cost of the requests in flight at the same moment. For a strict global limit, run one shared service (pattern D). |
+
+---
+
+### Choosing `tenant_id`
+
+`tenant_id` decides who shares a cache and who shares a budget.
+
+| You want | Use |
+|---|---|
+| Each customer or organization isolated from the others (the usual case) | `tenant_id=<customer or org id>` |
+| Per-user isolation (private data in answers) | `tenant_id=<user id>` (lower cache hit rate) |
+| One cache for public content such as FAQs | a single fixed `tenant_id`, or `"cache": {"scope": "global"}` in config |
+
+Never reuse one tenant for data that must not mix. With `scope="global"` any tenant can receive another's cached answer.
+
+### What else to change for your own use case
+
+| Goal | Where / what |
+|---|---|
+| Start from an industry setup | `gateway_from_preset("healthcare" \| "finance" \| "ecommerce" \| "customer_support" \| "legal" \| "education" \| "saas_devtools")` |
+| Keep settings outside code | `gateway_from_file("smartgate.json")` or set `SMARTGATE_CONFIG` / `SMARTGATE_PRESET` and call `gateway_from_env()`. See `examples/config.example.json` for every option. |
+| Keep personal data away from the model | `"policy": {"pii": "redact"}` (or `"block"`). Add `"phone_regions": ["US", "GB"]` for national phone formats. |
+| Spend limits | `gw.set_budget("tenant-id", Budget(limit_usd=100, period="monthly"))`, or `"budgets"` / `"default_budget"` in config |
+| Always use at least a certain tier for some requests | `"rules": [{"name": "vip", "tenants": ["gold-co"], "min_tier": "medium"}]` in config |
+| Stricter or looser cache matching | `"cache": {"similarity_threshold": 0.9}`; tune it on your own logs with `calibrate_threshold(...)` |
+| Make cache hits safer (recommended for high-stakes domains) | Plug in a verifier: `gateway_from_config(cfg, verifier=SymmetricVerifier(LLMPairVerifier(my_judge)))` |
+| Stronger semantic matching | `SemanticCache(embedder=CallableEmbedder(my_embed_fn, dim))`; the built-in embedder is lexical |
+| Domain words that change the action | `"cache": {"extra_action_classes": {"track": ["chase"]}}` |
+| Facts the bot may state without being flagged as invented | `"quality": {"grounding": true, "known_facts": ["30 days", "5-7 business days"]}` |
+| Let routing learn which request types need a stronger model | `Gateway(quality_tracker=QualityTracker(...))`, tag requests with `metadata={"route_key": "billing"}`, and report outcomes with `gw.feedback(r.request_id, score)` |
+| Send metrics to Datadog / Prometheus / OpenTelemetry | `gw.on("request.complete", fn)`, `gw.on("cache.hit", fn)`, `gw.on("fallback", fn)`, or `gw.on("*", fn)`; `gw.stats()` returns hit rate, spend, savings and circuit-breaker state |
+
+### Gotchas that cost the most hit rate (or money)
+
+- **Keep the system prompt stable.** The cache is scoped to the system prompt and earlier turns. If you paste user-specific or per-request data into the system prompt, nothing will ever repeat. Put variable data in the user message.
+- **Set a realistic `max_tokens`.** A hard budget reserves the worst case (input estimate + `max_tokens`) before each call. A huge `max_tokens` makes requests look expensive and can block them early.
+- **Time-sensitive and personal-data prompts are deliberately not cached** ("is it down right now?", messages with emails or phone numbers).
+- **Reuse one `Gateway` object.** It is thread-safe; creating one per request throws away the cache.
+- **Check the model names.** The default catalog uses `claude-haiku-5-5`, `claude-sonnet-5-5` and `claude-opus-5-5`; if your account uses other models, change the names and prices in your `"models"` list.
+
+### Roll-out checklist
+
+1. **Shadow it:** start with `use_cache=False` and the default routing; compare `r.cost_usd` and answers with your current setup.
+2. **Turn on PII redaction** and per-customer `tenant_id`.
+3. **Turn on caching** with a high threshold (0.97), strict presets first (`healthcare`, `legal`); lower it only after reviewing `cache.hit` events.
+4. **Calibrate** the threshold on your own labeled queries with `calibrate_threshold(...)`.
+5. **Add a verifier** and per-tenant **budgets** before widening the roll-out.
+6. **Watch** `gw.stats()` / the event hooks: cache hit rate, fallbacks, quality escalations, spend per tenant.
 
 ## Features
 
@@ -224,7 +450,7 @@ SMARTGATE_FUZZ=3000 pytest tests/advanced/test_properties.py   # deeper fuzzing
 | `advanced/test_regressions.py` | One test per bug found by the suites above |
 
 ## Production notes
-- Hard budgets reserve each call's worst-case cost before it runs (input estimate × 1.25 + `max_tokens`) and settle the real cost afterwards. Enforcement is atomic within one process; across replicas, use a shared `SpendLedger` with an atomic reserve step.
+- Hard budgets reserve each call's worst-case cost before it runs (input estimate × 1.25 + `max_tokens`) and settle the real cost afterwards. Enforcement is exact within one process. Across replicas a shared `SpendLedger` shares settled spend, but reservations stay per-process, so a limit can overshoot by the cost of in-flight requests; for a strict global limit run one shared service.
 - Semantic hits also require numbers and negations to match exactly ("feature 6" ≠ "feature 57", "safe" ≠ "not safe"). This is on by default (`guard_numbers`, `guard_negation`).
 - In-memory cache and spend ledger are per process. For multiple replicas, use a shared `VectorStore` (Redis or pgvector) and a shared `SpendLedger`, or put a single gateway service in front of your apps.
 - Tune `similarity_threshold` on your own traffic. Log `cache.hit` events with their similarity and review false hits before lowering it.
