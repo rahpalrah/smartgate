@@ -154,7 +154,7 @@ def build_providers(names: set, overrides: Optional[Dict[str, Provider]]) -> Dic
 
 
 def gateway_from_config(config: Dict[str, Any], providers: Optional[Dict[str, Provider]] = None,
-                        **gateway_kwargs: Any) -> Gateway:
+                        verifier=None, **gateway_kwargs: Any) -> Gateway:
     preset_name = config.get("preset", "general")
     if preset_name not in PRESETS:
         raise ConfigError(f"Unknown preset '{preset_name}'. Available: {sorted(PRESETS)}")
@@ -193,7 +193,7 @@ def gateway_from_config(config: Dict[str, Any], providers: Optional[Dict[str, Pr
     return Gateway(
         models=models,
         providers=build_providers({m.provider for m in models}, providers),
-        cache=SemanticCache(cache_cfg, store),
+        cache=SemanticCache(cache_cfg, store, verifier=verifier),
         analyzer=PromptAnalyzer(domain_keywords=cfg.get("domain_keywords")),
         routing=RoutingConfig(**cfg.get("routing", {})),
         rules=[_rule_from_dict(r) for r in cfg.get("rules", [])],

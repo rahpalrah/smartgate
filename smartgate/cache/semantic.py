@@ -138,6 +138,13 @@ class CacheConfig:
     guard_negation: bool = True
     guard_actions: bool = True
     guard_symbols: bool = True
+    # Second-stage check on semantic hits (see verify.py). A candidate is served only if the
+    # verifier scores it >= verify_min_score. A verifier that raises counts as "not the same"
+    # (fail closed) unless verify_fail_open. verify_skip_above skips verification for very
+    # similar candidates to save calls (None = verify every semantic hit).
+    verify_min_score: float = 0.5
+    verify_skip_above: Optional[float] = None
+    verify_fail_open: bool = False
     action_classes: Optional[Dict[str, List[str]]] = None  # None = DEFAULT_ACTION_CLASSES
     extra_action_classes: Dict[str, List[str]] = field(default_factory=dict)  # merged on top
     search_top_k: int = 5
@@ -156,8 +163,10 @@ class SemanticCache:
         config: Optional[CacheConfig] = None,
         store: Optional[VectorStore] = None,
         embedder: Optional[Embedder] = None,
+        verifier=None,
     ) -> None:
         self.config = config or CacheConfig()
+        self.verifier = verifier
         self.store: VectorStore = store or InMemoryVectorStore(self.config.max_entries)
         self.embedder: Embedder = embedder or HashingEmbedder()
         classes = {k: list(v) for k, v in (self.config.action_classes or DEFAULT_ACTION_CLASSES).items()}
@@ -166,7 +175,8 @@ class SemanticCache:
         self._actions = _compile_actions(classes) if self.config.guard_actions else None
         self._lock = threading.Lock()
         self.stats = {"hits": 0, "exact_hits": 0, "semantic_hits": 0, "misses": 0, "stores": 0,
-                      "guard_rejections": 0}
+                      "guard_rejections": 0, "verifier_calls": 0, "verifier_rejections": 0,
+                      "verifier_errors": 0}
 
     # ------------------------------------------------------------------ keys
     def namespace(self, request: GatewayRequest, partition: str = "") -> str:
@@ -207,6 +217,17 @@ class SemanticCache:
             if self.signature(entry.prompt) != sig:
                 self._bump("guard_rejections")
                 continue
+            if self.verifier is not None and (self.config.verify_skip_above is None
+                                              or score < self.config.verify_skip_above):
+                self._bump("verifier_calls")
+                try:
+                    verdict = float(self.verifier(prompt, entry.prompt))
+                except Exception:  # a broken verifier must never cause a wrong cache hit
+                    self._bump("verifier_errors")
+                    verdict = 1.0 if self.config.verify_fail_open else 0.0
+                if verdict < self.config.verify_min_score:
+                    self._bump("verifier_rejections")
+                    continue
             self.store.touch(entry.id)
             self._bump("hits"); self._bump("semantic_hits")
             return CacheHit(entry, round(score, 4), False)

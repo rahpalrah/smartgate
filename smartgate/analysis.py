@@ -156,11 +156,31 @@ MULTI_STEP_PATTERNS = re.compile(
     r"in detail|comprehensive|thorough|end[- ]to[- ]end|architecture|design a)",
     re.I | re.S,
 )
+# Time-sensitive = the correct answer changes over time, so a cached answer can go stale.
+# A weak time word alone ("I need help NOW", "I ordered it TODAY") is not enough; it counts only
+# together with a request for something that varies (status, price, ETA, availability...).
+_STRONG_TIME = re.compile(
+    r"\b(?:latest|breaking news|real[- ]time|stock prices?|share prices?|exchange rates?|weather|forecast|"
+    r"outage|(?:is|are|was|went)(?:n't| not)?\s+(?:\w+\s+){0,2}down|(?:server|service|site|website|app)\s+down|"
+    r"live\s+(?:score|status|updates?|feed|results?|traffic)|(?:flight|train|delivery|order)\s+status)\b", re.I)
+_WEAK_TIME = re.compile(
+    r"\b(?:now|right now|today|tonight|tomorrow|yesterday|currently|current|recent(?:ly)?|at the moment|"
+    r"as of|this (?:week|month|year|morning|afternoon|evening|weekend))\b", re.I)
+_VARIES = re.compile(
+    r"\b(?:status|(?:any|an|no|status|order|delivery)\s+updates?|updates?\s+(?:on|about|regarding|for)|news|outage|down|"
+    r"(?:is|are)\s+(?:\w+\s+){0,3}working|operational|available|availability|open|closed|prices?|rates?|cost|score|"
+    r"delay(?:ed|s)?|eta|arriv(?:e|es|ing|al)|when (?:will|does|do|is|are)|how long|where(?:'s| is| are)|"
+    r"any (?:update|news|word)|still waiting|what(?:'s| is) happening)\b", re.I)
+# Kept for backwards compatibility: the old, broader keyword list.
 TIME_SENSITIVE = re.compile(
     r"\b(today|tonight|now|current(?:ly)?|latest|this (?:week|month|year)|right now|"
     r"recent(?:ly)?|breaking|live|real[- ]time|stock price|weather|yesterday|tomorrow)\b",
     re.I,
 )
+
+
+def is_time_sensitive(text: str) -> bool:
+    return bool(_STRONG_TIME.search(text) or (_WEAK_TIME.search(text) and _VARIES.search(text)))
 PERSONAL_CONTEXT = re.compile(r"\b(my|our|i am|i'm|me)\b", re.I)
 
 
@@ -201,7 +221,9 @@ class PromptAnalyzer:
         self,
         extra_scorers: Optional[List[Scorer]] = None,
         domain_keywords: Optional[Dict[str, float]] = None,
+        time_sensitive_fn: Optional[Callable[[str], bool]] = None,
     ) -> None:
+        self.time_sensitive_fn = time_sensitive_fn or is_time_sensitive
         self.extra_scorers = list(extra_scorers or [])
         # keyword -> complexity boost, e.g. {"differential diagnosis": 0.3}
         self.domain_keywords = {k.lower(): v for k, v in (domain_keywords or {}).items()}
@@ -236,7 +258,7 @@ class PromptAnalyzer:
 
         complexity = sum(signals.values())
         pii = detect_pii(full_text)
-        time_sensitive = bool(TIME_SENSITIVE.search(user_text))
+        time_sensitive = self.time_sensitive_fn(user_text)
         personal = bool(PERSONAL_CONTEXT.search(user_text))
 
         analysis = PromptAnalysis(
