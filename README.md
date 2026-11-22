@@ -423,19 +423,19 @@ smartgate presets
 ## Benchmark on real data
 
 On 26,872 real-style support messages (Bitext dataset), with settings derived from one half and results reported on the other half:
-- **27% of requests served from cache with zero wrong answers.** A guessed threshold would have served wrong answers to 1 in 16 cache hits.
+- **27% of requests served from cache with zero wrong answers** on FAQ-style support data (about 3% on open-ended real tweets). A guessed threshold would have served wrong answers to 1 in 16 cache hits.
 - **No PII reached a model.**
 - **0 failed requests** when the large model was killed mid-run.
 - **Invented facts caught and escalated.**
 - **Adaptive routing raised answer quality during the run.**
 - **About 90% lower cost** than sending everything to Opus.
 
-Full method, numbers and limits: [docs/BENCHMARK.md](docs/BENCHMARK.md). A second benchmark on two Kaggle datasets (Quora Question Pairs and Customer Support on Twitter), including where the system is weak, is in [docs/KAGGLE_BENCHMARK.md](docs/KAGGLE_BENCHMARK.md).
+Full method, numbers and limits: [docs/BENCHMARK.md](docs/BENCHMARK.md). A second benchmark on two Kaggle datasets (Quora Question Pairs and Customer Support on Twitter), including where the system is weak and how a second-stage verifier cuts wrong cache hits by 83-90%, is in [docs/KAGGLE_BENCHMARK.md](docs/KAGGLE_BENCHMARK.md).
 
 ## Testing
 
 ```bash
-pytest -q                                              # 141 tests, ~15 s, fully offline
+pytest -q                                              # 184 tests, ~15 s, fully offline
 SMARTGATE_FUZZ=3000 pytest tests/advanced/test_properties.py   # deeper fuzzing
 ```
 
@@ -471,7 +471,7 @@ smartgate/
   providers/        Provider base, AnthropicProvider, CallableProvider, MockProvider
   config.py         dict/JSON/YAML config + industry presets
   server.py client.py cli.py observability.py
-tests/              141 tests: unit, e2e, HTTP, property-based, concurrency, chaos, quality benchmarks
+tests/              184 tests: unit, e2e, HTTP, property-based, concurrency, chaos, quality benchmarks
 ```
 
 ## License
