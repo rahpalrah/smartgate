@@ -2,7 +2,7 @@
 import pytest
 
 from smartgate import (CacheConfig, GatewayRequest, LLMPairVerifier, MemoizedVerifier, MockProvider,
-                       SemanticCache, gateway_from_config)
+                       SemanticCache, SymmetricVerifier, gateway_from_config)
 from smartgate.analysis import is_time_sensitive
 
 
@@ -98,3 +98,11 @@ def test_time_varying_questions_are_flagged(text):
 def test_ordinary_requests_with_a_time_word_are_not_flagged(text):
     # found by the Twitter benchmark: "now" alone flagged 14% of real messages (39% of flags)
     assert not is_time_sensitive(text)
+
+
+def test_symmetric_verifier_needs_both_orders_to_agree():
+    order_sensitive = lambda a, b: 0.9 if a < b else 0.2  # noqa: E731
+    assert order_sensitive("a", "b") == 0.9 and order_sensitive("b", "a") == 0.2
+    sym = SymmetricVerifier(order_sensitive)
+    assert sym("a", "b") == sym("b", "a") == 0.2
+    assert SymmetricVerifier(lambda a, b: 0.8)("x", "y") == 0.8

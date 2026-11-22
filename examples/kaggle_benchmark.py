@@ -126,6 +126,146 @@ def quora_part(path, n_pairs, embedders, target_precision):
     return out
 
 
+# ================================================================================ VERIFY
+class LocalJudge:
+    """YES/NO verifier from a local llama.cpp model: P(YES) read from the next-token logits.
+
+    The fixed instructions come first so llama.cpp reuses their cached state; only the two
+    questions are evaluated per call (about 0.2 s with a 1.5B model on 4 CPU cores).
+    """
+
+    def __init__(self, path):
+        import math
+        from llama_cpp import Llama
+        from smartgate.cache.verify import VERIFY_SYSTEM
+        self.math, self.system = math, VERIFY_SYSTEM
+        self.llm = Llama(model_path=path, n_ctx=1024, n_threads=os.cpu_count(), verbose=False)
+        self.yes = self.llm.tokenize(b"YES", add_bos=False, special=False)[0]
+        self.no = self.llm.tokenize(b"NO", add_bos=False, special=False)[0]
+        self.n_vocab, self.prev, self.calls, self.seconds = self.llm.n_vocab(), [], 0, 0.0
+
+    def __call__(self, new_query, cached_query):
+        from smartgate.cache.verify import pair_prompt
+        t0 = time.perf_counter()
+        text = (f"<|im_start|>system\n{self.system}<|im_end|>\n<|im_start|>user\n"
+                f"{pair_prompt(new_query, cached_query)}<|im_end|>\n<|im_start|>assistant\n")
+        toks = self.llm.tokenize(text.encode(), add_bos=False, special=True)
+        n = 0
+        while n < min(len(toks), len(self.prev)) and toks[n] == self.prev[n]:
+            n += 1
+        n = min(n, len(toks) - 1)
+        self.llm._ctx.kv_cache_seq_rm(-1, n, -1)
+        self.llm.n_tokens = n
+        self.llm.eval(toks[n:])
+        self.prev = toks
+        lg = np.ctypeslib.as_array(self.llm._ctx.get_logits(), shape=(self.n_vocab,))
+        self.calls += 1
+        self.seconds += time.perf_counter() - t0
+        return 1 / (1 + self.math.exp(float(lg[self.no]) - float(lg[self.yes])))
+
+
+def _auc(scores, y):
+    order = np.argsort(scores, kind="mergesort")
+    ranks = np.empty(len(scores)); ranks[order] = np.arange(1, len(scores) + 1)
+    pos = y == 1
+    n1, n0 = int(pos.sum()), int((~pos).sum())
+    return float((ranks[pos].sum() - n1 * (n1 + 1) / 2) / (n1 * n0)) if n1 and n0 else float("nan")
+
+
+def verify_part(path, n_pairs, nomic, models_dir, judge_files, retrieval_th, cal_n, work_dir,
+                symmetric_for=(), targets=(0.90, 0.95)):
+    from smartgate.embeddings import normalize_text  # noqa: F401
+    rnd = random.Random(5)  # same sample as quora_part
+    rows = [r for r in csv.DictReader(open(path, newline="", encoding="utf-8")) if r["question1"] and r["question2"]]
+    rnd.shuffle(rows)
+    rows = rows[:n_pairs]
+    half = len(rows) // 2
+    y = np.array([int(r["is_duplicate"]) for r in rows])
+    emb = CallableEmbedder(nomic.embed, 768)
+    v1 = np.array([emb.embed(r["question1"]) for r in rows], dtype=np.float32)
+    v2 = np.array([emb.embed(r["question2"]) for r in rows], dtype=np.float32)
+    sims = (v1 * v2).sum(1)
+    final = CacheConfig(similarity_threshold=retrieval_th, **GUARD_CONFIGS["+ symbols (final)"])
+    cache = SemanticCache(final, embedder=emb)
+    ok = np.array([cache.signature(r["question1"]) == cache.signature(r["question2"]) for r in rows])
+    exact = np.array([SemanticCache.exact_key(r["question1"]) == SemanticCache.exact_key(r["question2"]) for r in rows])
+    cand = (sims >= retrieval_th) & ok & ~exact          # semantic candidates the verifier would see
+    idx_all = np.arange(len(rows))
+    train_idx = idx_all[:half][cand[:half]]
+    test_idx = idx_all[half:][cand[half:]]
+    cal_idx = np.array(sorted(random.Random(3).sample(list(train_idx), min(cal_n, len(train_idx)))))
+    test = slice(half, None)
+    out = {"pairs": len(rows), "retrieval_threshold": retrieval_th, "test_candidates": int(len(test_idx)),
+           "calibration_sample": int(len(cal_idx)), "models": {}}
+
+    def metrics(served):
+        return _metrics(served[test], y[test])
+
+    base_served = exact | cand
+    out["no_verifier"] = metrics(base_served)
+    out["test_true_duplicates"] = int(y[test].sum())
+    print("[verify] no verifier:", json.dumps(out["no_verifier"]), flush=True)
+    def evaluate(s_arr):
+        sweep = [{"verify_min_score": vm, **metrics(exact | (cand & (s_arr >= vm)))}
+                 for vm in [0.05, 0.1, 0.2, 0.3, 0.5, 0.7, 0.8, 0.9, 0.95, 0.98]]
+        cal_s, cal_y = s_arr[cal_idx], y[cal_idx]
+        calibrated = {}
+        for tgt in targets:  # lowest cut-off whose precision on the train sample meets the target
+            pick = next((float(vm) for vm in np.round(np.arange(0.02, 1.0, 0.02), 2)
+                         if (cal_s >= vm).sum() >= 30 and cal_y[cal_s >= vm].mean() >= tgt), None)
+            calibrated[str(tgt)] = ({"met_on_train": False} if pick is None else
+                                    {"met_on_train": True, "verify_min_score": pick,
+                                     **metrics(exact | (cand & (s_arr >= pick)))})
+        return {"sweep": sweep, "calibrated_on_train_sample": calibrated,
+                "auc_on_candidates": round(_auc(s_arr[test_idx], y[test_idx]), 4)}
+
+    def load(fn):
+        return {int(k): v for k, v in json.load(open(fn)).items()} if os.path.exists(fn) else {}
+
+    def fill(judge, scores, fn, order):
+        todo = [int(i) for i in list(cal_idx) + list(test_idx) if int(i) not in scores]
+        for n, i in enumerate(todo, 1):
+            q1, q2 = rows[i]["question1"], rows[i]["question2"]
+            scores[i] = judge(q2, q1) if order == "prod" else judge(q1, q2)   # prod = (new=q2, cached=q1)
+            if n % 300 == 0:
+                json.dump(scores, open(fn, "w")); print(f"[verify] {os.path.basename(fn)}: {n}/{len(todo)}", flush=True)
+        json.dump(scores, open(fn, "w"))
+        arr = np.full(len(rows), -1.0)
+        for i, v in scores.items():
+            arr[i] = v
+        return arr
+
+    for jf in judge_files:
+        name = jf.split("-instruct")[0]
+        judge = LocalJudge(os.path.join(models_dir, jf))
+        prod_fn = os.path.join(work_dir, f"verify_scores_{name}.json")
+        prod = fill(judge, load(prod_fn), prod_fn, "prod")
+        res = {"production_order": evaluate(prod),
+               "similarity_auc_on_candidates": round(_auc(sims[test_idx], y[test_idx]), 4)}
+        if name in symmetric_for:
+            rev_fn = os.path.join(work_dir, f"verify_scores_{name}_rev.json")
+            rev = fill(judge, load(rev_fn), rev_fn, "rev")
+            res["symmetric_min_of_both_orders"] = evaluate(np.minimum(prod, rev))
+            res["verdict_flips_between_orders_at_0.5"] = int(((prod[test_idx] >= .5) != (rev[test_idx] >= .5)).sum())
+        res["seconds_per_verification"] = round(judge.seconds / max(judge.calls, 1), 3)
+        # the real SemanticCache.lookup() path with the verifier plugged in (production order)
+        chk = SemanticCache(CacheConfig(similarity_threshold=retrieval_th, ttl_seconds=None, verify_min_score=0.5,
+                                        **GUARD_CONFIGS["+ symbols (final)"]), embedder=emb, verifier=judge)
+        sample = random.Random(8).sample([int(i) for i in test_idx], min(120, len(test_idx)))
+        agree = 0
+        for i in sample:
+            chk.store.clear()
+            chk.store_response(GatewayRequest(messages=[Message("user", rows[i]["question1"])]), "A", "m")
+            hit = chk.lookup(GatewayRequest(messages=[Message("user", rows[i]["question2"])]))
+            agree += bool(hit) == bool(prod[i] >= 0.5)
+        res["lookup_path_selfcheck"] = {"pairs": len(sample), "agree": agree}
+        out["models"][name] = res
+        print(f"[verify] {name}: AUC verifier {res['production_order']['auc_on_candidates']} vs similarity "
+              f"{res['similarity_auc_on_candidates']}; selfcheck {agree}/{len(sample)}", flush=True)
+        del judge
+    return out
+
+
 # =============================================================================== TWITTER
 _URL = re.compile(r"https?://\S+")
 _AT = re.compile(r"@\w+")
@@ -344,7 +484,11 @@ def main():
     ap.add_argument("--quora-csv")
     ap.add_argument("--twitter-csv")
     ap.add_argument("--models-dir", required=True)
-    ap.add_argument("--part", choices=["quora", "twitter", "live", "all"], default="all")
+    ap.add_argument("--part", choices=["quora", "twitter", "live", "verify", "all"], default="all")
+    ap.add_argument("--verify-threshold", type=float, default=0.90)
+    ap.add_argument("--verify-cal-n", type=int, default=600)
+    ap.add_argument("--symmetric-for", default="qwen2.5-1.5b", help="judges also scored in both orders")
+    ap.add_argument("--judges", default="qwen2.5-1.5b-instruct-q4_k_m.gguf,qwen2.5-3b-instruct-q4_k_m.gguf")
     ap.add_argument("--n-quora", type=int, default=12000)
     ap.add_argument("--n-twitter", type=int, default=30000)
     ap.add_argument("--live-n", type=int, default=400)
@@ -369,6 +513,13 @@ def main():
         embedders = {"nomic-embed-text-v1.5": CallableEmbedder(nomic.embed, 768), "hashing (built-in)": sb.MemoHashing()}
         results["quora"] = quora_part(args.quora_csv, args.n_quora, embedders, args.target_precision)
         nomic.save(); save()
+
+    if args.part == "verify":
+        nomic = sb.NomicEmbedder(nomic_path, memo_path=os.path.join(args.work_dir, "nomic_quora.pkl"))
+        results["verify"] = verify_part(args.quora_csv, args.n_quora, nomic, args.models_dir,
+                                        args.judges.split(","), args.verify_threshold, args.verify_cal_n, args.work_dir,
+                                        symmetric_for=args.symmetric_for.split(","))
+        save()
 
     if args.part in ("twitter", "live", "all"):
         pairs = load_twitter(args.twitter_csv, args.n_twitter, os.path.join(args.work_dir, "twitter_pairs_top12.json"))

@@ -45,6 +45,21 @@ class LLMPairVerifier:
         return 1.0 if answer.startswith("YES") else 0.0
 
 
+class SymmetricVerifier:
+    """Require agreement in both orders: min(v(a, b), v(b, a)).
+
+    LLM judges are order-sensitive; on 220 real question pairs a 1.5B judge flipped its verdict
+    with the order of the two questions for 24% of them. Taking the minimum favors precision
+    (fewer wrong cache hits) at the price of two calls per candidate and fewer hits.
+    """
+
+    def __init__(self, verifier: PairVerifier) -> None:
+        self.verifier = verifier
+
+    def __call__(self, new_query: str, cached_query: str) -> float:
+        return min(self.verifier(new_query, cached_query), self.verifier(cached_query, new_query))
+
+
 class MemoizedVerifier:
     """LRU memo so the same (question, cached question) pair is judged once."""
 
