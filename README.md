@@ -19,18 +19,59 @@ request ─► Prompt analysis ─► Policy (PII redact/block) ─► Semantic 
 
 *Integrating into an existing system? Jump to [Integrate into your code](#integrate-into-your-code).*
 
-## Install
+## Download, install and update
 
-From GitHub:
+Requires Python 3.10 or newer.
+
+### 1. Download
+
+| Option | Command | Best for |
+|---|---|---|
+| **Clone** (recommended) | `git clone https://github.com/rahpalrah/smartgate.git && cd smartgate` | Trying it, changing it, getting updates with `git pull` |
+| **ZIP** | https://github.com/rahpalrah/smartgate/archive/refs/heads/main.zip | No git installed (no history; to update, download again) |
+| **No download, install straight into your project** | `pip install "smartgate[anthropic,fast] @ git+https://github.com/rahpalrah/smartgate.git"` | Using it as a dependency in your own code |
+
+### 2. Install (from a clone or unzipped folder)
+
 ```bash
-pip install "smartgate[anthropic] @ git+https://github.com/rahpalrah/smartgate.git"
+python -m venv .venv
+source .venv/bin/activate            # Windows: .venv\Scripts\activate
+pip install -e ".[anthropic,fast,pii,dev]"
+```
+`-e` ("editable") means changes you make to the downloaded code, and code you pull later, take effect immediately.
+
+### 3. Check that it works
+
+```bash
+pytest -q                            # about 25 s, fully offline, no API key needed
+python examples/quickstart.py        # offline demo with a mock model
+export ANTHROPIC_API_KEY=...         # then run it against Claude:
+python examples/quickstart.py --live
 ```
 
-From a clone, for development:
+### 4. Pull updates
+
+If you cloned it:
 ```bash
-git clone https://github.com/rahpalrah/smartgate.git && cd smartgate
-pip install -e ".[anthropic,fast,dev]"
+git pull origin main
+pip install -e ".[anthropic,fast,pii,dev]"   # only needed if pyproject.toml changed
+pytest -q                                     # confirm nothing broke
 ```
+If you have local edits and `git pull` refuses, commit them or run `git stash` first, then `git pull`, then `git stash pop`.
+
+If you installed with `pip install ... @ git+https://...`:
+```bash
+pip install --upgrade --force-reinstall --no-deps "smartgate @ git+https://github.com/rahpalrah/smartgate.git"
+```
+(`--force-reinstall` is needed because the version number stays `0.1.0` between commits; `--no-deps` keeps your existing `anthropic` / `numpy` installs.)
+
+**Pin an exact version** so an update can't surprise you: there are no tagged releases yet, so pin a commit:
+```bash
+pip install "smartgate @ git+https://github.com/rahpalrah/smartgate.git@<commit-sha>"
+```
+See what changed with `git log --oneline -10`, or the commit list on GitHub.
+
+### Optional extras
 
 | Extra | Adds |
 |---|---|
