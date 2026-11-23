@@ -49,11 +49,12 @@ python -m smartgate --preset customer_support --mock serve    # HTTP service on 
 export ANTHROPIC_API_KEY=...                    # or ANTHROPIC_AUTH_TOKEN; ANTHROPIC_BASE_URL is optional
 python examples/quickstart.py --live
 ```
-**Local or self-hosted models** (Ollama, vLLM, LM Studio, llama.cpp server, an internal gateway) through the built-in `OpenAICompatibleProvider`:
+**Local models with Ollama + Qwen: free, offline, no API key** (see the next section).
+**Any other local or self-hosted server** (vLLM, LM Studio, llama.cpp server, an internal gateway) through the built-in `OpenAICompatibleProvider`:
 ```python
 from smartgate import Gateway, ModelSpec, OpenAICompatibleProvider
-gw = Gateway(models=[ModelSpec("llama3.2:3b", "local", "small", 0, 0)],
-             providers={"local": OpenAICompatibleProvider("http://localhost:11434/v1")})
+gw = Gateway(models=[ModelSpec("my-model", "local", "small", 0, 0)],
+             providers={"local": OpenAICompatibleProvider("http://localhost:8000/v1")})
 print(gw.generate("Hello!").text)
 ```
 **No model at all** (tests, demos, CI): `MockProvider` answers offline.
@@ -73,7 +74,7 @@ If you installed with pip: `pip install --upgrade --force-reinstall "smartgate @
 | Need | Built-in, standard library only |
 |---|---|
 | Calling Claude | `AnthropicProvider`: HTTPS to the Messages API, credentials from `ANTHROPIC_API_KEY` / `ANTHROPIC_AUTH_TOKEN`. Already have an SDK client (Bedrock, Vertex, ...)? Pass it as `client=`; smartgate never imports the SDK. |
-| Local / self-hosted models | `OpenAICompatibleProvider` (the common `/chat/completions` protocol) |
+| Local models | `OllamaProvider` + `gateway_from_ollama()` (Qwen2.5 tiers on Ollama, no API key), and `OpenAICompatibleProvider` for any server speaking `/chat/completions` |
 | Cache search | an exact vector index on `array` + `math.sumprod`: about **7 ms per 1,000 entries, 72 ms at 10,000** (per tenant). Larger caches: plug a `VectorStore` of your own. |
 | Cache storage | memory, or SQLite (`sqlite3` is in the standard library) |
 | Text similarity | `HashingEmbedder` (lexical). It catches rephrasings and near-duplicates, not deep paraphrases; plug in any neural model with `CallableEmbedder` if you have one. |
@@ -103,6 +104,40 @@ gw.stats()                                          # hit rate, spend, savings, 
 ```
 
 Run without an API key: `python examples/quickstart.py`, which uses the offline `MockProvider`. Add `--live` to call Claude.
+
+## Use Ollama + Qwen (free, fully local)
+
+[Ollama](https://ollama.com) runs open models on your own machine. It is a separate program, not a Python package, so smartgate stays dependency-free and just talks to it over local HTTP. The built-in setup uses **Qwen2.5** models as the three tiers: easy prompts go to the small one, hard ones to the large one.
+
+```bash
+ollama pull qwen2.5:1.5b qwen2.5:3b qwen2.5:7b      # once; use --ollama-profile light for 0.5b / 1.5b / 3b
+python -m smartgate ollama-check                     # confirms Ollama is running and prints any missing `ollama pull`
+python -m smartgate --ollama --preset customer_support ask "How do I reset my password?"
+python examples/ollama_qwen_demo.py                  # routing, cache, cost and verifier on real local models
+```
+```python
+from smartgate import gateway_from_ollama
+gw = gateway_from_ollama(preset="customer_support", verify_with="medium")   # small/medium/large = qwen2.5 1.5b/3b/7b
+r = gw.generate("How do I reset my password?", tenant_id="acme")
+print(r.text, r.model, r.cache_hit)
+```
+
+| Option | Meaning |
+|---|---|
+| `profile` / `--ollama-profile` | `light` = 0.5b/1.5b/3b (about 4 GB RAM), `standard` = 1.5b/3b/7b (default, about 8 GB), `strong` = 3b/7b/14b |
+| `models=[...]` / `--ollama-models a,b,c` | your own three Ollama tags for small, medium, large (any model, not only Qwen) |
+| `host=` / `--ollama-host` / `OLLAMA_HOST` | where Ollama runs; same address forms and port defaults as Ollama itself |
+| `shadow_prices=True` / `--shadow-prices` | price local calls at Claude Haiku/Sonnet/Opus list prices so cost reports and budgets show what the traffic would cost on Claude (otherwise every call costs $0 and budgets never trigger) |
+| `verify_with="medium"` / `--verify-with medium` | that model double-checks every cache hit before it is served. Use medium or large: on a 12-pair test the 0.5b model was right only about 2 times in 3, while 1.5b and 3b were right on all 12. |
+| `context_tokens=` / `--ollama-context` | the context window Ollama runs with (default 4096) |
+| `check=True` | verify Ollama is reachable and has the models before starting (the CLI always does) |
+
+**Things to know**
+- **First request after idle is slow.** Ollama loads the model into memory on demand, so the first call can take many seconds; the provider's default timeout is 300 s.
+- **Context length.** Ollama's default context window is small. For long prompts raise it (`OLLAMA_CONTEXT_LENGTH=8192 ollama serve`) and pass the same number as `context_tokens`; otherwise Ollama silently cuts the prompt.
+- **Quality is the trade-off.** Small local models answer worse than Claude and sometimes invent specifics. Keep the grounding check on (it is, in the support, e-commerce, finance and healthcare presets) and have the verifier on for caching.
+- **Other Qwen versions** (or any model) work via `models=[...]`. Models that print their reasoning ("thinking") may return extra text; try them before relying on them.
+- **What was tested.** The Ollama provider is covered by the test suite against a fake Ollama server, and was run end-to-end against real Qwen2.5 0.5b / 1.5b / 3b models served by llama.cpp's server under Ollama-style model names (same `/v1/chat/completions` API). It has **not** been run against Ollama itself, and the 7b profile has not been run.
 
 ## Integrate into your code
 
@@ -484,7 +519,7 @@ python -m smartgate selftest         # 18 checks, ~2 s, standard library only, n
 **Full development suite** (needs the dev tools `pytest` and `hypothesis`):
 ```bash
 pip install -e ".[dev]"
-pytest -q                                                      # 214 tests, ~35 s, fully offline
+pytest -q                                                      # 239 tests, ~35 s, fully offline
 SMARTGATE_FUZZ=3000 pytest tests/advanced/test_properties.py   # deeper fuzzing
 ```
 
@@ -492,6 +527,7 @@ SMARTGATE_FUZZ=3000 pytest tests/advanced/test_properties.py   # deeper fuzzing
 |---|---|
 | `smartgate/selftest.py` | The standalone check above, including a real HTTP round trip to a fake Claude API |
 | `tests/test_standalone.py` | The package runs with `site-packages` disabled (`python -S`): no third-party module is ever imported, and `pyproject.toml` declares no dependencies |
+| `tests/test_ollama.py` | Ollama + Qwen: host forms, installed/missing models, tiers, failover when a model isn't pulled, the verifier option and the command line, against a fake Ollama |
 | `tests/test_http_providers.py` | The built-in Claude and local-model providers over real HTTP: request shape, headers, every error class, `retry-after`, timeouts, failover |
 | `tests/test_*.py` | Unit and end-to-end behaviour of every component and the HTTP server |
 | `advanced/test_properties.py` | Invariants for random inputs (hypothesis): complexity bounds, PII redaction completeness, tenant isolation, router chain validity, budget limits |
@@ -527,7 +563,7 @@ smartgate/                     the whole library: standard library only, copy th
   selftest.py __main__.py      `python -m smartgate selftest`
 examples/                      runnable with no dependencies (quickstart, industries, config files)
 benchmarks/                    reproduce the published results; these need extra tools (see its README)
-tests/                         214 tests: unit, e2e, HTTP, property-based, concurrency, chaos, quality, standalone
+tests/                         239 tests: unit, e2e, HTTP, property-based, concurrency, chaos, quality, standalone
 ```
 
 ## License

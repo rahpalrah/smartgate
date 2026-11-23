@@ -146,6 +146,9 @@ def build_providers(names: set, overrides: Optional[Dict[str, Provider]]) -> Dic
         if name == "anthropic":
             from .providers.anthropic_provider import AnthropicProvider
             providers[name] = AnthropicProvider()
+        elif name == "ollama":
+            from .providers.ollama import OllamaProvider
+            providers[name] = OllamaProvider()
         elif name == "mock":
             from .providers.mock import MockProvider
             providers[name] = MockProvider()

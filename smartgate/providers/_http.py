@@ -35,8 +35,17 @@ def error_from_status(status: int, message: str, retry_after: Optional[float] = 
 
 
 def post_json(url: str, headers: Dict[str, str], body: Dict[str, Any], timeout: float) -> Dict[str, Any]:
-    data = json.dumps(body).encode("utf-8")
-    request = urllib.request.Request(url, data=data, method="POST",
+    return _request_json(url, "POST", headers, body, timeout)
+
+
+def get_json(url: str, headers: Dict[str, str], timeout: float) -> Dict[str, Any]:
+    return _request_json(url, "GET", headers, None, timeout)
+
+
+def _request_json(url: str, method: str, headers: Dict[str, str], body: Optional[Dict[str, Any]],
+                  timeout: float) -> Dict[str, Any]:
+    data = json.dumps(body).encode("utf-8") if body is not None else None
+    request = urllib.request.Request(url, data=data, method=method,
                                      headers={"Content-Type": "application/json", **headers})
     try:
         with urllib.request.urlopen(request, timeout=timeout) as response:

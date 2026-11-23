@@ -6,11 +6,24 @@ import json
 import logging
 import sys
 
+from .errors import GatewayError
 from .config import PRESETS, gateway_from_config, load_config_file
+
+
+def _ollama_models(args):
+    return [m.strip() for m in args.ollama_models.split(",")] if args.ollama_models else None
 
 
 def _gateway(args):
     cfg = load_config_file(args.config) if args.config else {}
+    if args.ollama:
+        from .providers.ollama import gateway_from_ollama
+        preset = args.preset or cfg.pop("preset", "general")
+        cfg.pop("models", None)  # the three Ollama tiers define the models
+        return gateway_from_ollama(args.ollama_profile, host=args.ollama_host, preset=preset,
+                                   models=_ollama_models(args), shadow_prices=args.shadow_prices,
+                                   context_tokens=args.ollama_context, verify_with=args.verify_with,
+                                   overrides=cfg, check=True)
     if args.preset:
         cfg["preset"] = args.preset
     if args.mock:
@@ -18,11 +31,42 @@ def _gateway(args):
     return gateway_from_config(cfg)
 
 
+def _ollama_check(args) -> int:
+    from .providers.ollama import OllamaProvider, qwen_models
+    provider = OllamaProvider(args.ollama_host)
+    specs = qwen_models(args.ollama_profile, _ollama_models(args), args.ollama_context)
+    try:
+        installed = provider.installed_models()
+    except Exception as exc:
+        print(f"Cannot reach Ollama at {provider.host}: {exc}\nStart it with:  ollama serve")
+        return 1
+    missing = provider.missing_models(specs)
+    print(f"Ollama at {provider.host}: {len(installed)} model(s) installed")
+    for spec in specs:
+        print(f"  {spec.tier:6} {spec.name:16} {'MISSING' if spec.name in missing else 'ok'}")
+    if missing:
+        print("\nInstall the missing models:\n" + "\n".join(f"  ollama pull {m}" for m in missing))
+        return 1
+    print("\nAll set. Try:  python -m smartgate --ollama ask \"How do I reset my password?\"")
+    return 0
+
+
 def main(argv=None) -> int:
     p = argparse.ArgumentParser(prog="smartgate", description="Semantic cache & model routing gateway")
     p.add_argument("--config", help="JSON or TOML config file")
     p.add_argument("--preset", choices=sorted(PRESETS))
     p.add_argument("--mock", action="store_true", help="use the offline mock provider (no API calls)")
+    p.add_argument("--ollama", action="store_true",
+                   help="use local models on Ollama (default: Qwen2.5 small/medium/large); no API key needed")
+    p.add_argument("--ollama-host", help="Ollama address (default: $OLLAMA_HOST or localhost:11434)")
+    p.add_argument("--ollama-profile", default="standard", choices=["light", "standard", "strong"],
+                   help="Qwen2.5 sizes for small/medium/large: light 0.5b/1.5b/3b, standard 1.5b/3b/7b, strong 3b/7b/14b")
+    p.add_argument("--ollama-models", help="three comma-separated Ollama tags for small,medium,large (overrides the profile)")
+    p.add_argument("--ollama-context", type=int, default=4096, help="context window Ollama runs with (default 4096)")
+    p.add_argument("--verify-with", choices=["small", "medium", "large"],
+                   help="with --ollama: this tier's model double-checks cache hits (use medium or large, not the 0.5b model)")
+    p.add_argument("--shadow-prices", action="store_true",
+                   help="with --ollama: price local models at Claude list prices so budgets and cost reports mean something")
     sub = p.add_subparsers(dest="cmd", required=True)
 
     s = sub.add_parser("serve")
@@ -37,16 +81,27 @@ def main(argv=None) -> int:
     q.add_argument("prompt")
     q.add_argument("--tenant", default="default")
     sub.add_parser("presets")
+    sub.add_parser("ollama-check", help="check that Ollama is running and has the Qwen models")
     sub.add_parser("selftest", help="verify this installation (standard library only, no network)")
 
     args = p.parse_args(argv)
     if args.cmd == "selftest":
         from .selftest import run
         return run()
+    if args.cmd == "ollama-check":
+        return _ollama_check(args)
     if args.cmd == "presets":
         print(json.dumps(PRESETS, indent=2))
         return 0
 
+    try:
+        return _run(args)
+    except GatewayError as exc:  # configuration, budget, policy, provider failures: a message, not a traceback
+        print(f"error: {exc}", file=sys.stderr)
+        return 2
+
+
+def _run(args) -> int:
     gw = _gateway(args)
     if args.cmd == "analyze":
         print(json.dumps(gw.analyze(args.prompt), indent=2))
