@@ -1,6 +1,8 @@
-__pycache__/
-*.egg-info/
 *.db
-.pytest_cache/
-benchmark_report.json
+*.egg-info/
 .hypothesis/
+.pytest_cache/
+__pycache__/
+benchmark_report.json
+build/
+dist/
