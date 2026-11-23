@@ -5,17 +5,14 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "smartgate"
 version = "0.1.0"
-description = "Semantic cache & model routing gateway SDK: prompt analysis, complexity-based model selection, cost controls and fallbacks."
+description = "Dependency-free semantic cache & model routing gateway for LLM apps: prompt analysis, complexity-based model selection, cost controls and fallbacks."
 readme = "README.md"
-requires-python = ">=3.10"
+requires-python = ">=3.11"
 license = { text = "MIT" }
-dependencies = []  # core is stdlib-only
+dependencies = []  # none: the library uses only the Python standard library
 
 [project.optional-dependencies]
-anthropic = ["anthropic"]
-yaml = ["pyyaml"]
-fast = ["numpy"]
-pii = ["phonenumbers"]
+# Development tooling only (running the test suite). Nothing here is needed to use smartgate.
 dev = ["pytest", "hypothesis"]
 
 [project.urls]

@@ -4,7 +4,7 @@ Reproduce (download the data from Kaggle yourself; it is not redistributed here)
 ```bash
 kaggle datasets download -d quora/question-pairs-dataset
 kaggle datasets download -d thoughtvector/customer-support-on-twitter
-python examples/kaggle_benchmark.py --quora-csv questions.csv --twitter-csv twcs.csv \
+python benchmarks/kaggle_benchmark.py --quora-csv questions.csv --twitter-csv twcs.csv \
     --models-dir ./models --part all
 ```
 

@@ -2,7 +2,7 @@
 
 A drop-in layer between your applications and LLMs that **answers repeat questions from a semantic cache**, **sends each prompt to the cheapest model that can handle it**, **enforces per-tenant budgets**, and **fails over automatically** when a model is down or refuses.
 
-- **Zero-dependency core** (Python stdlib). `anthropic` and `pyyaml` are optional extras.
+- **Standalone: zero dependencies, nothing to install.** Pure Python standard library (3.11+). The whole library is one folder (`smartgate/`) you can run in place or copy into your project. No SDKs, no NumPy, no database, no other service. Claude is called over plain HTTPS by built-in code, and local models through a built-in provider.
 - **Two ways to use it:** embed as a Python library, or run it as an HTTP service any language can call over plain HTTP + JSON (Python client included).
 - **Industry presets:** healthcare, finance, e-commerce, customer support, legal, education and SaaS/devtools, all overridable.
 - **Pluggable everywhere:** providers, embedders, vector stores, spend ledgers, analyzers, routing rules and event hooks.
@@ -19,9 +19,9 @@ request ─► Prompt analysis ─► Policy (PII redact/block) ─► Semantic 
 
 *Integrating into an existing system? Jump to [Integrate into your code](#integrate-into-your-code).*
 
-## Download, install and update
+## Download and run (no dependencies)
 
-Requires Python 3.10 or newer.
+Requires **Python 3.11 or newer**. Nothing else: no `pip install`, no packages, no accounts.
 
 ### 1. Download
 
@@ -29,59 +29,60 @@ Requires Python 3.10 or newer.
 |---|---|---|
 | **Clone** (recommended) | `git clone https://github.com/rahpalrah/smartgate.git && cd smartgate` | Trying it, changing it, getting updates with `git pull` |
 | **ZIP** | https://github.com/rahpalrah/smartgate/archive/refs/heads/main.zip | No git installed (no history; to update, download again) |
-| **No download, install straight into your project** | `pip install "smartgate[anthropic,fast] @ git+https://github.com/rahpalrah/smartgate.git"` | Using it as a dependency in your own code |
+| **Copy into your project** | copy the `smartgate/` folder next to your code | Shipping it with your application (it is self-contained, MIT licensed) |
+| **pip, if you prefer** | `pip install "smartgate @ git+https://github.com/rahpalrah/smartgate.git"` | Adds a `smartgate` command and normal `import smartgate` anywhere |
 
-### 2. Install (from a clone or unzipped folder)
+### 2. Run it straight from the folder
 
 ```bash
-python -m venv .venv
-source .venv/bin/activate            # Windows: .venv\Scripts\activate
-pip install -e ".[anthropic,fast,pii,dev]"
+cd smartgate
+python -m smartgate selftest                    # verifies the whole library, standard library only (~2 s)
+python examples/quickstart.py                   # offline demo with a built-in mock model
+python -m smartgate --preset customer_support --mock serve    # HTTP service on http://127.0.0.1:8080
 ```
-`-e` ("editable") means changes you make to the downloaded code, and code you pull later, take effect immediately.
+`python -m smartgate ...` works from the downloaded folder with no installation. (After `pip install`, the same commands are available as `smartgate selftest`, `smartgate serve`, ...)
 
-### 3. Check that it works
+### 3. Use a real model (still nothing to install)
 
+**Claude**, over plain HTTPS using built-in code:
 ```bash
-pytest -q                            # about 25 s, fully offline, no API key needed
-python examples/quickstart.py        # offline demo with a mock model
-export ANTHROPIC_API_KEY=...         # then run it against Claude:
+export ANTHROPIC_API_KEY=...                    # or ANTHROPIC_AUTH_TOKEN; ANTHROPIC_BASE_URL is optional
 python examples/quickstart.py --live
 ```
+**Local or self-hosted models** (Ollama, vLLM, LM Studio, llama.cpp server, an internal gateway) through the built-in `OpenAICompatibleProvider`:
+```python
+from smartgate import Gateway, ModelSpec, OpenAICompatibleProvider
+gw = Gateway(models=[ModelSpec("llama3.2:3b", "local", "small", 0, 0)],
+             providers={"local": OpenAICompatibleProvider("http://localhost:11434/v1")})
+print(gw.generate("Hello!").text)
+```
+**No model at all** (tests, demos, CI): `MockProvider` answers offline.
 
-### 4. Pull updates
+### 4. Update
 
-If you cloned it:
 ```bash
 git pull origin main
-pip install -e ".[anthropic,fast,pii,dev]"   # only needed if pyproject.toml changed
-pytest -q                                     # confirm nothing broke
+python -m smartgate selftest                    # confirm nothing broke
 ```
 If you have local edits and `git pull` refuses, commit them or run `git stash` first, then `git pull`, then `git stash pop`.
+If you installed with pip: `pip install --upgrade --force-reinstall "smartgate @ git+https://github.com/rahpalrah/smartgate.git"` (needed because the version number stays `0.1.0` between commits).
+**Pin an exact version** so an update can't surprise you (there are no tagged releases yet, so pin a commit): `pip install "smartgate @ git+https://github.com/rahpalrah/smartgate.git@<commit-sha>"`. See what changed with `git log --oneline -10`.
 
-If you installed with `pip install ... @ git+https://...`:
-```bash
-pip install --upgrade --force-reinstall --no-deps "smartgate @ git+https://github.com/rahpalrah/smartgate.git"
-```
-(`--force-reinstall` is needed because the version number stays `0.1.0` between commits; `--no-deps` keeps your existing `anthropic` / `numpy` installs.)
+### What is built in (and what replaced the old third-party pieces)
 
-**Pin an exact version** so an update can't surprise you: there are no tagged releases yet, so pin a commit:
-```bash
-pip install "smartgate @ git+https://github.com/rahpalrah/smartgate.git@<commit-sha>"
-```
-See what changed with `git log --oneline -10`, or the commit list on GitHub.
-
-### Optional extras
-
-| Extra | Adds |
+| Need | Built-in, standard library only |
 |---|---|
-| `anthropic` | Claude provider (official `anthropic` SDK) |
-| `fast` | NumPy-accelerated cache search (~0.4 ms at 10k entries vs ~150 ms in pure Python) |
-| `pii` | International phone-number detection (Google's libphonenumber) |
-| `yaml` | YAML config files |
-| `dev` | pytest, hypothesis |
+| Calling Claude | `AnthropicProvider`: HTTPS to the Messages API, credentials from `ANTHROPIC_API_KEY` / `ANTHROPIC_AUTH_TOKEN`. Already have an SDK client (Bedrock, Vertex, ...)? Pass it as `client=`; smartgate never imports the SDK. |
+| Local / self-hosted models | `OpenAICompatibleProvider` (the common `/chat/completions` protocol) |
+| Cache search | an exact vector index on `array` + `math.sumprod`: about **7 ms per 1,000 entries, 72 ms at 10,000** (per tenant). Larger caches: plug a `VectorStore` of your own. |
+| Cache storage | memory, or SQLite (`sqlite3` is in the standard library) |
+| Text similarity | `HashingEmbedder` (lexical). It catches rephrasings and near-duplicates, not deep paraphrases; plug in any neural model with `CallableEmbedder` if you have one. |
+| Personal-data detection | emails, SSNs, Luhn-checked cards, IBANs, IPs, medical record numbers, and phone numbers: any `+country-code` number (ITU calling-code table) plus national formats for US, CA, GB, IN, DE, FR, AU, ES via `phone_regions` |
+| Config files | JSON or TOML (`.toml` needs Python 3.11+, already required). YAML is not supported. |
+| HTTP service and client | `smartgate serve`, `GatewayClient` (`http.server` / `urllib`) |
+| Verifying an install | `python -m smartgate selftest` (18 checks, including a real HTTP round trip to a fake Claude API) |
 
-Credentials for Claude resolve the standard way: `ANTHROPIC_API_KEY`, `ANTHROPIC_AUTH_TOKEN`, or an `ant auth login` profile.
+The only optional tooling is for **developing** smartgate: `pip install -e ".[dev]"` adds `pytest` and `hypothesis` to run the full test suite (`pytest -q`). The benchmarks in `benchmarks/` need extra tools and are separate from the library.
 
 ## 60-second tour
 
@@ -167,7 +168,7 @@ answer = r.text                                                         # line 5
 | 5 | `resp.content[0].text` becomes `r.text`. |
 
 Also available on the result: `r.model`, `r.cost_usd`, `r.cache_hit`, `r.saved_usd`, `r.usage`, `r.route_reason`, `r.request_id`, `r.quality_warning`.
-Credentials are unchanged: the Claude provider reads `ANTHROPIC_API_KEY` (or an `ant auth login` profile) exactly like the SDK.
+Credentials: the built-in Claude provider reads `ANTHROPIC_API_KEY` (or `ANTHROPIC_AUTH_TOKEN`), like the SDK. Credentials stored by `ant auth login` are an SDK feature: if you rely on them, pass your SDK client as `AnthropicProvider(client=...)`.
 
 ### Pattern B — web backend (FastAPI shown; Flask and Django are the same idea)
 
@@ -388,7 +389,7 @@ PromptAnalyzer(domain_keywords={"indemnif": 0.25},
 - **Refusals** (`stop_reason == "refusal"`) fail over to the next model. Bad requests are raised immediately, because another model wouldn't fix them.
 
 ### 6. Policy and observability
-- `PolicyConfig(pii="allow|redact|block", blocked_terms=[...], max_input_tokens=..., phone_regions=["US", "GB"])`. Install the `pii` extra (Google's libphonenumber) for international phone numbers; `phone_regions` adds national formats such as UK `020 7946 0958`. Redaction runs before the model call and before the cache key is built.
+- `PolicyConfig(pii="allow|redact|block", blocked_terms=[...], max_input_tokens=..., phone_regions=["US", "GB"])`. Any `+country-code` phone number is detected out of the box; `phone_regions` adds national formats such as UK `020 7946 0958` (built in for US, CA, GB, IN, DE, FR, AU, ES). Redaction runs before the model call and before the cache key is built.
 - Hooks: `gw.on("cache.hit" | "fallback" | "budget.exceeded" | "*", fn)`. Use them to bridge into OpenTelemetry, Prometheus, Datadog or an audit log. A hook that throws never breaks a request.
 
 ## Industry presets
@@ -427,9 +428,10 @@ Subclass `Provider` and implement `complete(model, request) -> ProviderResponse`
 
 ## Run as a service (any language)
 ```bash
-smartgate --config examples/config.example.json serve --port 8080 \
+python -m smartgate --config examples/config.example.toml serve --port 8080 \
   --api-keys '{"key-acme":"acme","key-ops":"ops"}' --admin-keys key-ops
-# offline demo: smartgate --preset customer_support --mock serve
+# offline demo: python -m smartgate --preset customer_support --mock serve
+# (after `pip install`, the same commands start with `smartgate` instead of `python -m smartgate`)
 ```
 ```bash
 curl -s localhost:8080/v1/generate -H "Authorization: Bearer key-acme" \
@@ -475,19 +477,29 @@ Full method, numbers and limits: [docs/BENCHMARK.md](docs/BENCHMARK.md). A secon
 
 ## Testing
 
+**Check an install with nothing but Python:**
 ```bash
-pytest -q                                              # 184 tests, ~15 s, fully offline
+python -m smartgate selftest         # 18 checks, ~2 s, standard library only, no network, no API key
+```
+**Full development suite** (needs the dev tools `pytest` and `hypothesis`):
+```bash
+pip install -e ".[dev]"
+pytest -q                                                      # 214 tests, ~35 s, fully offline
 SMARTGATE_FUZZ=3000 pytest tests/advanced/test_properties.py   # deeper fuzzing
 ```
 
 | Suite | Proves |
 |---|---|
+| `smartgate/selftest.py` | The standalone check above, including a real HTTP round trip to a fake Claude API |
+| `tests/test_standalone.py` | The package runs with `site-packages` disabled (`python -S`): no third-party module is ever imported, and `pyproject.toml` declares no dependencies |
+| `tests/test_http_providers.py` | The built-in Claude and local-model providers over real HTTP: request shape, headers, every error class, `retry-after`, timeouts, failover |
 | `tests/test_*.py` | Unit and end-to-end behaviour of every component and the HTTP server |
 | `advanced/test_properties.py` | Invariants for random inputs (hypothesis): complexity bounds, PII redaction completeness, tenant isolation, router chain validity, budget limits |
 | `advanced/test_concurrency.py` | 32-64 threads: the hard budget is never overspent, the ledger equals billed responses, no cross-tenant cache leaks, exactly one model call per distinct prompt (request coalescing) |
 | `advanced/test_chaos.py` | Random provider failures, refusals, outages; circuit breaker opens and recovers; ≥97% availability under mixed chaos |
 | `advanced/test_quality.py` | Routing accuracy on a labeled set (87.5%, 0 severe misroutes), zero cache false hits on near-miss pairs, 82% cost savings vs. always-Opus. Writes `benchmark_report.json` |
 | `advanced/test_system.py` | HTTP under 40 concurrent clients, budget enforced over HTTP, SQLite cache shared across processes, lookup latency at 10k entries |
+| `advanced/test_verifier.py`, `advanced/test_best_practices.py` | The cache verifier, grounding, adaptive routing, action/symbol guards, phone formats, time-sensitive rule |
 | `advanced/test_regressions.py` | One test per bug found by the suites above |
 
 ## Production notes
@@ -500,19 +512,22 @@ SMARTGATE_FUZZ=3000 pytest tests/advanced/test_properties.py   # deeper fuzzing
 
 ## Layout
 ```
-smartgate/
-  gateway.py        orchestrator (analysis → policy → cache → route → budget → call → record)
-  analysis.py       complexity, task type, PII, cacheability
-  cache/            SemanticCache, verification guards, calibration, InMemory/SQLite stores
-  quality.py        answer validator for cascade escalation
-  embeddings.py     HashingEmbedder, CallableEmbedder
-  routing.py        ModelRouter, RoutingRule, fallback ordering
-  cost.py           Budget, CostController, SpendLedger
-  resilience.py     RetryPolicy, CircuitBreaker
-  providers/        Provider base, AnthropicProvider, CallableProvider, MockProvider
-  config.py         dict/JSON/YAML config + industry presets
-  server.py client.py cli.py observability.py
-tests/              184 tests: unit, e2e, HTTP, property-based, concurrency, chaos, quality benchmarks
+smartgate/                     the whole library: standard library only, copy this folder to use it
+  gateway.py                   orchestrator (analysis → policy → cache → route → budget → call → record)
+  analysis.py                  complexity, task type, PII (incl. phone numbers), time-sensitivity, cacheability
+  cache/                       SemanticCache, verification guards, calibration, verifier, memory/SQLite stores
+  quality.py                   answer validators, grounding, adaptive-routing tracker
+  embeddings.py                HashingEmbedder, CallableEmbedder
+  routing.py                   ModelRouter, RoutingRule, fallback ordering
+  cost.py                      Budget, CostController, SpendLedger
+  resilience.py                RetryPolicy, CircuitBreaker
+  providers/                   AnthropicProvider (HTTPS), OpenAICompatibleProvider, CallableProvider, MockProvider
+  config.py                    dict / JSON / TOML config + industry presets
+  server.py client.py cli.py   HTTP service, Python client, command line
+  selftest.py __main__.py      `python -m smartgate selftest`
+examples/                      runnable with no dependencies (quickstart, industries, config files)
+benchmarks/                    reproduce the published results; these need extra tools (see its README)
+tests/                         214 tests: unit, e2e, HTTP, property-based, concurrency, chaos, quality, standalone
 ```
 
 ## License

@@ -8,11 +8,13 @@ from .embeddings import CallableEmbedder, HashingEmbedder
 from .errors import (AllModelsFailedError, BudgetExceededError, ConfigError, GatewayError,
                      PolicyViolationError, ProviderError)
 from .gateway import Gateway, PolicyConfig, ResilienceConfig
-from .providers import CallableProvider, MockProvider, Provider
+from .providers import (AnthropicProvider, CallableProvider, MockProvider, OpenAICompatibleProvider,
+                        Provider)
 from .quality import (GroundingValidator, LLMJudgeValidator, QualityTracker, chain,
                       default_validator)
 from .cache.calibrate import calibrate_threshold, confusion_report
-from .cache.verify import LLMPairVerifier, MemoizedVerifier, PairVerifier, SymmetricVerifier
+from .cache.verify import (LLMPairVerifier, MemoizedVerifier, PairVerifier, SymmetricVerifier,
+                           provider_verifier)
 from .resilience import CircuitBreaker, RetryPolicy
 from .routing import ModelRouter, RoutingConfig, RoutingRule
 from .types import GatewayRequest, GatewayResponse, Message, ModelSpec, ProviderResponse, Usage

@@ -21,18 +21,36 @@ PII_PATTERNS: Dict[str, re.Pattern] = {
     "ip_address": re.compile(r"\b(?:\d{1,3}\.){3}\d{1,3}\b"),
 }
 
-# Phone numbers. With `phonenumbers` (Google's libphonenumber) installed, numbers are validated
-# per region, which catches international formats. Without it, regexes cover North American
-# and +country-code formats. Either way a match needs separators, parentheses or a leading "+":
-# bare digit runs are order/invoice/tracking numbers far more often than phone numbers.
-try:
-    import phonenumbers as _pn
-except ImportError:  # pragma: no cover
-    _pn = None
+# Phone numbers, standard library only. A match needs a leading "+country-code", parentheses or
+# separators: bare digit runs are order/invoice/tracking numbers far more often than phone numbers.
+#  * "+CC ..." numbers are accepted for any assigned ITU country calling code (table below).
+#  * National formats (no "+") are recognized for the regions in PHONE_REGIONS (default: US).
+# Built-in national patterns: US, CA, GB, IN, DE, FR, AU, ES. Other countries are detected in
+# their international "+CC" form.
+CALLING_CODES = frozenset((
+    "1 7 20 27 30 31 32 33 34 36 39 40 41 43 44 45 46 47 48 49 51 52 53 54 55 56 57 58 60 61 62 63 64 65 66 "
+    "81 82 84 86 90 91 92 93 94 95 98 "
+    "211 212 213 216 218 220 221 222 223 224 225 226 227 228 229 230 231 232 233 234 235 236 237 238 239 240 "
+    "241 242 243 244 245 246 247 248 249 250 251 252 253 254 255 256 257 258 260 261 262 263 264 265 266 267 "
+    "268 269 290 291 297 298 299 350 351 352 353 354 355 356 357 358 359 370 371 372 373 374 375 376 377 378 "
+    "380 381 382 383 385 386 387 389 420 421 423 500 501 502 503 504 505 506 507 508 509 590 591 592 593 594 "
+    "595 596 597 598 599 670 672 673 674 675 676 677 678 679 680 681 682 683 685 686 687 688 689 690 691 692 "
+    "850 852 853 855 856 880 886 960 961 962 963 964 965 966 967 968 970 971 972 973 974 975 976 977 992 993 "
+    "994 995 996 998").split())
 PHONE_REGIONS: List[str] = ["US"]
-_US_PHONE = re.compile(r"(?<![\w+])(?:\+\d{1,3}[\s.-]?)?(?:\(\d{3}\)\s?|\d{3}[\s.-])\d{3}[\s.-]\d{4}(?!\d)")
-_INTL_PHONE = re.compile(r"(?<![\w+])\+\d{1,3}(?:[\s.-]?\(?\d{1,5}\)?){1,6}(?![\w])")
-_SEPARATED = re.compile(r"[\s().+-]")
+_US_PHONE = re.compile(r"(?<![\w+])(?:\(\d{3}\)\s?|\d{3}[\s.-])\d{3}[\s.-]\d{4}(?!\d)")
+_INTL_PHONE = re.compile(r"(?<![\w+])\+\s?\d{1,3}(?:[\s.-]?\(?\d{1,5}\)?){1,6}(?![\w])")
+_NATIONAL_PHONE: Dict[str, List["re.Pattern"]] = {
+    "US": [_US_PHONE],
+    "CA": [_US_PHONE],
+    "GB": [re.compile(r"(?<![\w+])0\d{2,4}[ -]\d{3,4}(?:[ -]\d{3,4})?(?!\d)")],
+    "IN": [re.compile(r"(?<![\w+])0?[6-9]\d{4}[ -]\d{5}(?!\d)")],
+    "DE": [re.compile(r"(?<![\w+])0\d{2,4}[ /-]\d{3,8}(?:[ -]\d{1,4})?(?!\d)")],
+    "FR": [re.compile(r"(?<![\w+])0[1-9](?:[ .-]\d{2}){4}(?!\d)")],
+    "AU": [re.compile(r"(?<![\w+])0[2-478][ -]?\d{4}[ -]\d{4}(?!\d)"),
+           re.compile(r"(?<![\w+])04\d{2}[ -]\d{3}[ -]\d{3}(?!\d)")],
+    "ES": [re.compile(r"(?<![\w+])[6-9]\d{2}[ -]\d{2}[ -]\d{2}[ -]\d{2}(?!\d)")],
+}
 
 
 def set_phone_regions(regions: List[str]) -> None:
@@ -40,18 +58,24 @@ def set_phone_regions(regions: List[str]) -> None:
     PHONE_REGIONS[:] = [r.upper() for r in regions]
 
 
+def _valid_international(text: str) -> bool:
+    """E.164 shape (8-15 digits) whose leading digits are an assigned country calling code."""
+    digits = "".join(ch for ch in text if ch.isdigit())
+    if not 8 <= len(digits) <= 15:
+        return False
+    return any(digits[:n] in CALLING_CODES and len(digits) - n >= 5 for n in (1, 2, 3))
+
+
 def _phone_spans(text: str) -> List[Tuple[int, int]]:
     spans: List[Tuple[int, int]] = []
-    if _pn is not None:
-        for region in PHONE_REGIONS:
-            for m in _pn.PhoneNumberMatcher(text, region, leniency=_pn.Leniency.VALID):
-                if _SEPARATED.search(m.raw_string):
-                    spans.append((m.start, m.end))
-    for rx in (_US_PHONE, _INTL_PHONE):
-        for m in rx.finditer(text):
-            digits = sum(ch.isdigit() for ch in m.group())
-            if 8 <= digits <= 15:
-                spans.append(m.span())
+    for m in _INTL_PHONE.finditer(text):
+        if _valid_international(m.group()):
+            spans.append(m.span())
+    for region in PHONE_REGIONS:
+        for rx in _NATIONAL_PHONE.get(region, []):
+            for m in rx.finditer(text):
+                if 8 <= sum(ch.isdigit() for ch in m.group()) <= 15:
+                    spans.append(m.span())
     spans.sort()
     merged: List[Tuple[int, int]] = []
     for a, b in spans:

@@ -1,0 +1,53 @@
+# smartgate configuration in TOML (read by the Python standard library, no packages needed).
+# Run:  smartgate --config examples/config.example.toml serve
+# Every key is optional; the same structure is accepted as JSON (see config.example.json).
+
+preset = "customer_support"          # general | healthcare | finance | ecommerce | customer_support | legal | education | saas_devtools
+
+[cache]
+similarity_threshold = 0.9
+ttl_seconds = 43200
+scope = "tenant"                     # "tenant" = isolated per customer, "global" = shared
+
+[cache_store]
+type = "sqlite"                      # or "memory"
+path = "smartgate_cache.db"
+
+[routing]
+small_max = 0.4
+medium_max = 0.72
+fallback_strategy = "same_tier_then_up"
+
+[policy]
+pii = "redact"                       # allow | redact | block
+phone_regions = ["US", "GB"]         # national phone formats to detect, in addition to +country-code numbers
+
+[default_budget]
+limit_usd = 50
+period = "monthly"
+downgrade_at = 0.8
+
+[budgets.enterprise-co]
+limit_usd = 5000
+period = "monthly"
+hard_limit = false
+
+[resilience]
+max_models_tried = 3
+breaker_failure_threshold = 5
+breaker_recovery_seconds = 30
+
+[resilience.retry]
+max_attempts = 3
+base_delay = 0.5
+max_delay = 8
+
+[[rules]]
+name = "gold-tenants"
+tenants = ["enterprise-co"]
+min_tier = "medium"
+
+[[rules]]
+name = "code"
+task_types = ["code"]
+min_tier = "medium"

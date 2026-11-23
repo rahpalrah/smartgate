@@ -12,7 +12,9 @@ import json
 import sqlite3
 import threading
 import time
+from array import array
 from collections import OrderedDict
+from heapq import nlargest
 from dataclasses import asdict, dataclass, field
 from typing import Dict, List, Optional, Protocol, Tuple
 
@@ -50,32 +52,34 @@ class VectorStore(Protocol):
     def size(self) -> int: ...
 
 
-try:  # optional acceleration: vectorized similarity search
-    import numpy as _np
+try:  # math.sumprod (Python 3.12+) runs the dot product in C; older versions use a slower fallback
+    from math import sumprod as _dot
 except ImportError:  # pragma: no cover
-    _np = None
+    from operator import mul as _mul
+
+    def _dot(a, b):
+        return sum(map(_mul, a, b))
 
 
 class _NamespaceIndex:
-    """Dense matrix of one namespace's embeddings; O(1) add/remove (swap-with-last)."""
+    """Exact nearest-neighbour index for one namespace, standard library only.
+
+    Vectors are stored as compact float32 arrays (about 4 bytes per dimension) and scanned with
+    a C-speed dot product. O(1) add/remove (swap-with-last). A scan costs roughly 7-15 ms per
+    1,000 entries at 512-768 dimensions, so this suits caches up to a few tens of thousands of
+    entries per namespace; beyond that, back the cache with your own `VectorStore`.
+    """
 
     def __init__(self, dim: int) -> None:
         self.dim = dim
         self.ids: List[str] = []
         self.pos: Dict[str, int] = {}
-        self.rows: list = []  # pure-python fallback
-        self.mat = _np.zeros((64, dim), dtype=_np.float32) if _np is not None else None
+        self.rows: List[array] = []
 
     def add(self, entry_id: str, vec: List[float]) -> None:
-        row = len(self.ids)
-        if self.mat is not None:
-            if row >= self.mat.shape[0]:
-                self.mat = _np.concatenate([self.mat, _np.zeros_like(self.mat)])
-            self.mat[row] = vec
-        else:
-            self.rows.append(vec)
+        self.pos[entry_id] = len(self.ids)
         self.ids.append(entry_id)
-        self.pos[entry_id] = row
+        self.rows.append(array("f", vec))
 
     def remove(self, entry_id: str) -> None:
         row = self.pos.pop(entry_id, None)
@@ -85,33 +89,22 @@ class _NamespaceIndex:
         if row != last:
             moved = self.ids[last]
             self.ids[row] = moved
+            self.rows[row] = self.rows[last]
             self.pos[moved] = row
-            if self.mat is not None:
-                self.mat[row] = self.mat[last]
-            else:
-                self.rows[row] = self.rows[last]
         self.ids.pop()
-        if self.mat is None:
-            self.rows.pop()
+        self.rows.pop()
 
     def search(self, vec: List[float], k: int) -> List[Tuple[str, float]]:
-        n = len(self.ids)
-        if n == 0:
+        if not self.ids:
             return []
-        if self.mat is not None:
-            scores = self.mat[:n] @ _np.asarray(vec, dtype=_np.float32)
-            k = min(k, n)
-            top = _np.argpartition(-scores, k - 1)[:k]
-            top = top[_np.argsort(-scores[top])]
-            return [(self.ids[i], float(scores[i])) for i in top]
-        scored = sorted(((cosine(vec, r), i) for i, r in enumerate(self.rows)), reverse=True)[:k]
-        return [(self.ids[i], sc) for sc, i in scored]
+        query = array("f", vec)
+        best = nlargest(k, ((_dot(query, row), i) for i, row in enumerate(self.rows)))
+        return [(self.ids[i], float(score)) for score, i in best]
 
 
 class InMemoryVectorStore:
     """Thread-safe, LRU-bounded store with a per-namespace vector index.
 
-    Uses NumPy for search when installed (~1 ms at 10k entries); pure Python otherwise.
     Expired entries are dropped lazily when they surface in a search and by a periodic sweep.
     """
 

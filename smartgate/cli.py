@@ -20,7 +20,7 @@ def _gateway(args):
 
 def main(argv=None) -> int:
     p = argparse.ArgumentParser(prog="smartgate", description="Semantic cache & model routing gateway")
-    p.add_argument("--config", help="JSON/YAML config file")
+    p.add_argument("--config", help="JSON or TOML config file")
     p.add_argument("--preset", choices=sorted(PRESETS))
     p.add_argument("--mock", action="store_true", help="use the offline mock provider (no API calls)")
     sub = p.add_subparsers(dest="cmd", required=True)
@@ -37,8 +37,12 @@ def main(argv=None) -> int:
     q.add_argument("prompt")
     q.add_argument("--tenant", default="default")
     sub.add_parser("presets")
+    sub.add_parser("selftest", help="verify this installation (standard library only, no network)")
 
     args = p.parse_args(argv)
+    if args.cmd == "selftest":
+        from .selftest import run
+        return run()
     if args.cmd == "presets":
         print(json.dumps(PRESETS, indent=2))
         return 0

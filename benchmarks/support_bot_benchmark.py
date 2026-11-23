@@ -14,7 +14,7 @@ Part A (--part cache): replays ALL messages through the gateway. The stand-in pr
 Part B (--part live):  replays a sample through the three real local models, measures real
         latency and token usage, and kills the large model mid-run to exercise failover.
 
-    python examples/support_bot_benchmark.py --data bitext.csv --models-dir ./models --part all
+    python benchmarks/support_bot_benchmark.py --data bitext.csv --models-dir ./models --part all
 """
 from __future__ import annotations
 

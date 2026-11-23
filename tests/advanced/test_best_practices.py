@@ -101,7 +101,6 @@ class TestInternationalPhones:
         assert not any(ch.isdigit() for ch in redact_pii(text).replace("[REDACTED_PHONE]", ""))
 
     def test_national_format_needs_region(self):
-        pytest.importorskip("phonenumbers")
         try:
             assert "phone" not in detect_pii("ring 020 7946 0958")
             set_phone_regions(["US", "GB"])

@@ -1,4 +1,4 @@
-"""Declarative configuration (dict / JSON / YAML) and industry presets."""
+"""Declarative configuration (dict / JSON / TOML) and industry presets."""
 from __future__ import annotations
 
 import copy
@@ -104,15 +104,16 @@ def deep_merge(base: Dict[str, Any], override: Dict[str, Any]) -> Dict[str, Any]
 
 
 def load_config_file(path: str) -> Dict[str, Any]:
+    """Load a JSON (.json) or TOML (.toml) config file. Both are read by the standard library."""
+    lower = path.lower()
+    if lower.endswith((".yaml", ".yml")):
+        raise ConfigError("YAML is not supported (smartgate has no dependencies). Use a .json or .toml file.")
+    if lower.endswith(".toml"):
+        import tomllib
+        with open(path, "rb") as f:
+            return tomllib.load(f)
     with open(path) as f:
-        text = f.read()
-    if path.endswith((".yaml", ".yml")):
-        try:
-            import yaml  # type: ignore
-        except ImportError as exc:
-            raise ConfigError("YAML config requires `pip install pyyaml`") from exc
-        return yaml.safe_load(text) or {}
-    return json.loads(text)
+        return json.loads(f.read())
 
 
 def _rule_from_dict(d: Dict[str, Any]) -> RoutingRule:

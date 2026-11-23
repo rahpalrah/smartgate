@@ -2,7 +2,7 @@
 
 Reproduce:
 ```bash
-python examples/support_bot_benchmark.py --data <bitext.csv> --models-dir <models> --part all
+python benchmarks/support_bot_benchmark.py --data <bitext.csv> --models-dir <models> --part all
 ```
 
 ## Setup

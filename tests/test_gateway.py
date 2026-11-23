@@ -130,10 +130,6 @@ class TestPresets:
 
 
 class TestAnthropicProvider:
-    @pytest.fixture(autouse=True)
-    def _needs_sdk(self):
-        pytest.importorskip("anthropic", reason="pip install smartgate[anthropic]")
-
     def _client(self, stop_reason="end_turn"):
         def create(**kw):
             self.kwargs = kw

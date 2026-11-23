@@ -6,8 +6,8 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        python: ["3.10", "3.11", "3.12", "3.13"]
-        extras: ["dev,anthropic", "dev,anthropic,fast,pii"]
+        python: ["3.11", "3.12", "3.13"]
+        extras: ["dev"]
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5

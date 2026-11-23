@@ -2,7 +2,6 @@
 import pytest
 
 from smartgate import CacheConfig, GatewayRequest, SemanticCache, detect_pii, redact_pii
-from smartgate.cache import store as store_mod
 
 
 def req(t, **kw):
@@ -33,12 +32,7 @@ def test_bug3b_order_numbers_are_not_cards():
     assert "credit_card" not in detect_pii("order 1234 5678 9012 3456")
 
 
-@pytest.fixture
-def no_numpy(monkeypatch):
-    monkeypatch.setattr(store_mod, "_np", None)
-
-
-def test_pure_python_fallback_index(no_numpy):
+def test_vector_index_evicts_searches_and_clears():
     c = SemanticCache(CacheConfig(similarity_threshold=0.9, max_entries=50))
     for i in range(80):
         c.store_response(req(f"question about topic {i}"), f"a{i}", "m")

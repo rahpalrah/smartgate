@@ -1,5 +1,5 @@
 """Quickstart. Runs offline with the mock provider; pass --live to call Claude
-(needs `pip install anthropic` and ANTHROPIC_API_KEY or `ant auth login`)."""
+(needs only the ANTHROPIC_API_KEY environment variable; no package to install)."""
 import sys
 
 from smartgate import Budget, MockProvider, gateway_from_preset

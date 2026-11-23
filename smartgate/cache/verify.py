@@ -80,3 +80,25 @@ class MemoizedVerifier:
             while len(self._memo) > self.max_entries:
                 self._memo.popitem(last=False)
         return score
+
+
+def provider_verifier(provider, model, max_tokens: int = 3, symmetric: bool = False) -> PairVerifier:
+    """Build a verifier from any smartgate provider and one of its models.
+
+    The judge model answers YES or NO for each candidate pair. Works with the built-in
+    `AnthropicProvider` (Claude over plain HTTPS) and `OpenAICompatibleProvider` (local servers),
+    so no SDK or extra package is involved. Use a small, cheap model as the judge.
+
+        judge = provider_verifier(AnthropicProvider(), ModelSpec("claude-haiku-5-5", "anthropic", "small", 0.1, 0.5))
+        cache = SemanticCache(verifier=MemoizedVerifier(judge))
+
+    Set `symmetric=True` to require YES in both question orders (fewer wrong hits, twice the calls).
+    """
+    from ..types import GatewayRequest, Message
+
+    def complete(system: str, user: str) -> str:
+        request = GatewayRequest(messages=[Message("user", user)], system=system, max_tokens=max_tokens)
+        return provider.complete(model, request).text
+
+    verifier: PairVerifier = LLMPairVerifier(complete)
+    return SymmetricVerifier(verifier) if symmetric else verifier

@@ -9,12 +9,12 @@
   live     Real local models (Qwen2.5 0.5B/1.5B/3B via llama-cpp-python) on Twitter traffic:
            answer quality per tier, grounding, adaptive routing, failover.
 
-    python examples/kaggle_benchmark.py --quora-csv questions.csv --twitter-csv twcs.csv \\
+    python benchmarks/kaggle_benchmark.py --quora-csv questions.csv --twitter-csv twcs.csv \\
         --models-dir ./models --part all
 
 Data is never redistributed or committed; download it from Kaggle yourself.
 Needs: numpy; for twitter/live also llama-cpp-python and the GGUF models used by
-examples/support_bot_benchmark.py.
+benchmarks/support_bot_benchmark.py.
 """
 from __future__ import annotations
 

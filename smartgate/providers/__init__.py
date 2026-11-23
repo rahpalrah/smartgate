@@ -1,12 +1,6 @@
+from .anthropic_provider import AnthropicProvider
 from .base import CallableProvider, Provider
 from .mock import MockProvider
+from .openai_compatible import OpenAICompatibleProvider
 
-
-def __getattr__(name):  # lazy: only import the anthropic SDK when used
-    if name == "AnthropicProvider":
-        from .anthropic_provider import AnthropicProvider
-        return AnthropicProvider
-    raise AttributeError(name)
-
-
-__all__ = ["Provider", "CallableProvider", "MockProvider", "AnthropicProvider"]
+__all__ = ["Provider", "CallableProvider", "MockProvider", "AnthropicProvider", "OpenAICompatibleProvider"]
