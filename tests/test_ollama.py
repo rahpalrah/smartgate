@@ -84,8 +84,14 @@ class TestHostAndModels:
         assert [s.name for s in qwen_models(models=["a:1", "b:2", "c:3"])] == ["a:1", "b:2", "c:3"]
         with pytest.raises(ConfigError):
             qwen_models("nope")
+        one = qwen_models(models=["qwen2.5:3b"])
+        assert [(m.name, m.tier) for m in one] == [("qwen2.5:3b", "medium")]       # a single model serves everything
+        two = qwen_models(models=["a:1b", "b:7b"])
+        assert [m.tier for m in two] == ["small", "large"]
         with pytest.raises(ConfigError):
-            qwen_models(models=["only-one"])
+            qwen_models(models=[])
+        with pytest.raises(ConfigError):
+            qwen_models(models=["a", "b", "c", "d"])
 
     def test_installed_and_missing_models(self, ollama):
         p = OllamaProvider(ollama.host)
@@ -209,3 +215,59 @@ class TestVerifyWith:
         with redirect_stdout(out), redirect_stderr(err):
             code = main(["--ollama", "--ollama-host", ollama.host, "--verify-with", "medium", "ask", "hello there"])
         assert code == 0
+
+
+class TestAutoDetect:
+    def test_detects_qwen_models_smallest_first_and_skips_others(self):
+        from smartgate.providers.ollama import detect_models, model_size_billions
+        installed = ["llama3.2:3b", "qwen2.5:7b", "nomic-embed-text:latest", "qwen2.5:0.5b", "qwen2.5-coder:1.5b",
+                     "qwen3:30b-a3b", "qwen2.5:latest"]
+        assert detect_models(installed) == ["qwen2.5:0.5b", "qwen2.5-coder:1.5b", "qwen2.5:7b", "qwen3:30b-a3b",
+                                            "qwen2.5:latest"]
+        assert model_size_billions("qwen2.5:1.5b") == 1.5 and model_size_billions("qwen2.5:latest") == float("inf")
+
+    def test_only_a_qwen_3b_installed_runs_everything_on_it(self):
+        o = FakeOllama(installed=("qwen2.5:3b", "nomic-embed-text:latest"))
+        try:
+            gw = gateway_from_ollama(host=o.host, models="auto", preset="customer_support")
+            assert [(m.name, m.tier) for m in gw.router.models] == [("qwen2.5:3b", "medium")]
+            easy = gw.generate("How do I reset my password?")
+            hard = gw.generate("Design an end-to-end architecture for a payments ledger. First analyze the "
+                               "trade-offs, then implement it in Python, ensuring idempotency. Compare three approaches.")
+            assert easy.model == hard.model == "qwen2.5:3b" and easy.text.startswith("[qwen2.5:3b]")
+            judged = gateway_from_ollama(host=o.host, models="auto", verify_with="medium")   # judge = the same 3b
+            assert judged.cache.verifier is not None
+        finally:
+            o.close()
+
+    def test_many_installed_models_are_reduced_to_three(self):
+        o = FakeOllama(installed=("qwen2.5:0.5b", "qwen2.5:1.5b", "qwen2.5:3b", "qwen2.5:7b", "qwen2.5:14b"))
+        try:
+            gw = gateway_from_ollama(host=o.host, models="auto")
+            assert [(m.name, m.tier) for m in gw.router.models] == [("qwen2.5:0.5b", "small"),
+                                                                    ("qwen2.5:3b", "medium"), ("qwen2.5:14b", "large")]
+        finally:
+            o.close()
+
+    def test_no_qwen_installed_says_what_to_pull(self):
+        o = FakeOllama(installed=("llama3.2:3b",))
+        try:
+            with pytest.raises(ConfigError) as e:
+                gateway_from_ollama(host=o.host, models="auto")
+            assert "ollama pull qwen2.5:3b" in str(e.value) and "llama3.2:3b" in str(e.value)
+        finally:
+            o.close()
+
+    def test_cli_auto_and_check(self):
+        o = FakeOllama(installed=("qwen2.5:3b",))
+        try:
+            out, err = io.StringIO(), io.StringIO()
+            with redirect_stdout(out), redirect_stderr(err):
+                assert main(["--ollama", "--ollama-host", o.host, "--ollama-models", "auto", "ask", "hello"]) == 0
+            assert "[qwen2.5:3b] hello" in out.getvalue() and "model=qwen2.5:3b" in err.getvalue()
+            out = io.StringIO()
+            with redirect_stdout(out):
+                assert main(["--ollama-host", o.host, "--ollama-models", "auto", "ollama-check"]) == 0
+            assert "qwen2.5:3b" in out.getvalue() and "ok" in out.getvalue()
+        finally:
+            o.close()

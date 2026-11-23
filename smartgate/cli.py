@@ -11,7 +11,11 @@ from .config import PRESETS, gateway_from_config, load_config_file
 
 
 def _ollama_models(args):
-    return [m.strip() for m in args.ollama_models.split(",")] if args.ollama_models else None
+    if not args.ollama_models:
+        return None
+    if args.ollama_models.strip() == "auto":
+        return "auto"
+    return [m.strip() for m in args.ollama_models.split(",")]
 
 
 def _gateway(args):
@@ -32,16 +36,19 @@ def _gateway(args):
 
 
 def _ollama_check(args) -> int:
-    from .providers.ollama import OllamaProvider, qwen_models
+    from .providers.ollama import OllamaProvider, auto_models, qwen_models
     provider = OllamaProvider(args.ollama_host)
-    specs = qwen_models(args.ollama_profile, _ollama_models(args), args.ollama_context)
     try:
         installed = provider.installed_models()
     except Exception as exc:
         print(f"Cannot reach Ollama at {provider.host}: {exc}\nStart it with:  ollama serve")
         return 1
+    wanted = _ollama_models(args)
+    if wanted == "auto":
+        wanted = auto_models(provider)
+    specs = qwen_models(args.ollama_profile, wanted, args.ollama_context)
     missing = provider.missing_models(specs)
-    print(f"Ollama at {provider.host}: {len(installed)} model(s) installed")
+    print(f"Ollama at {provider.host}: {len(installed)} model(s) installed: {', '.join(installed) or 'none'}")
     for spec in specs:
         print(f"  {spec.tier:6} {spec.name:16} {'MISSING' if spec.name in missing else 'ok'}")
     if missing:
@@ -61,7 +68,8 @@ def main(argv=None) -> int:
     p.add_argument("--ollama-host", help="Ollama address (default: $OLLAMA_HOST or localhost:11434)")
     p.add_argument("--ollama-profile", default="standard", choices=["light", "standard", "strong"],
                    help="Qwen2.5 sizes for small/medium/large: light 0.5b/1.5b/3b, standard 1.5b/3b/7b, strong 3b/7b/14b")
-    p.add_argument("--ollama-models", help="three comma-separated Ollama tags for small,medium,large (overrides the profile)")
+    p.add_argument("--ollama-models", help='1 to 3 comma-separated Ollama tags (small,medium,large), or "auto" to use the Qwen '
+                        "models Ollama already has (overrides the profile)")
     p.add_argument("--ollama-context", type=int, default=4096, help="context window Ollama runs with (default 4096)")
     p.add_argument("--verify-with", choices=["small", "medium", "large"],
                    help="with --ollama: this tier's model double-checks cache hits (use medium or large, not the 0.5b model)")

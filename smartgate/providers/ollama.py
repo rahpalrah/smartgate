@@ -12,6 +12,7 @@ Ollama is a separate program you run on your own machine; smartgate talks to it 
 from __future__ import annotations
 
 import os
+import re
 from dataclasses import asdict
 from typing import Any, Dict, Iterable, List, Optional, Union
 from urllib.parse import urlparse
@@ -55,6 +56,23 @@ def normalize_host(host: Optional[str] = None) -> str:
     return f"{parsed.scheme}://{hostname}:{port}"
 
 
+def model_size_billions(tag: str) -> float:
+    """Parameter count in billions parsed from an Ollama tag ("qwen2.5:3b" -> 3.0); unknown sorts last."""
+    m = re.search(r"(\d+(?:\.\d+)?)b", tag.split(":", 1)[-1].lower()) or re.search(r"(\d+(?:\.\d+)?)b", tag.lower())
+    return float(m.group(1)) if m else float("inf")
+
+
+def detect_models(installed: Iterable[str], family: str = "qwen") -> List[str]:
+    """Installed models of a family (default Qwen), smallest first. Embedding models are skipped."""
+    names = [n for n in installed if family.lower() in n.lower() and "embed" not in n.lower()]
+    return sorted(names, key=lambda n: (model_size_billions(n), n))
+
+
+def _pick_tiers(names: List[str]) -> List[str]:
+    """Reduce any number of models to at most three: the smallest, a middle one, the largest."""
+    return names if len(names) <= 3 else [names[0], names[len(names) // 2], names[-1]]
+
+
 def _tag(name: str) -> str:
     """Ollama treats a bare name as :latest."""
     return name if ":" in name else name + ":latest"
@@ -90,33 +108,53 @@ class OllamaProvider(OpenAICompatibleProvider):
 
 def qwen_models(profile: str = "standard", models: Optional[Iterable[str]] = None, context_tokens: int = 4096,
                 max_output_tokens: int = 2048, shadow_prices: bool = False, provider: str = "ollama") -> List[ModelSpec]:
-    """Small / medium / large model specs backed by Qwen models on Ollama.
+    """Model specs for Ollama, by default Qwen2.5 as small / medium / large.
 
-    profile          "light" | "standard" | "strong" (see QWEN_PROFILES), or pass `models=` with three tags.
+    profile          "light" | "standard" | "strong" (see QWEN_PROFILES).
+    models           your own tags instead of a profile: 3 tags = small, medium, large; 2 tags = small and
+                     large; 1 tag = a single model that serves every request (tier "medium").
     context_tokens   the context window you run Ollama with. Ollama's default is small (4096 in current
                      versions); raise it with OLLAMA_CONTEXT_LENGTH and pass the same number here, or long
                      prompts are silently cut off by Ollama.
     shadow_prices    price the local models at Claude Haiku / Sonnet / Opus list prices, so cost reports and
                      budgets show what the same traffic would cost on Claude. Off = every call costs $0.
     """
-    names = tuple(models) if models is not None else QWEN_PROFILES.get(profile)
-    if not names or len(names) != 3:
-        raise ConfigError(f"profile must be one of {sorted(QWEN_PROFILES)}, or give exactly 3 model tags")
+    names = list(models) if models is not None else list(QWEN_PROFILES.get(profile) or ())
+    if not 1 <= len(names) <= 3:
+        raise ConfigError(f"profile must be one of {sorted(QWEN_PROFILES)}, or give 1 to 3 model tags")
+    tiers = {1: ("medium",), 2: ("small", "large"), 3: TIERS}[len(names)]
+    prices = {t: p for t, p in zip(TIERS, SHADOW_PRICES)}
     out = []
-    for tier, name, (_, price_in, price_out) in zip(TIERS, names, SHADOW_PRICES):
+    for tier, name in zip(tiers, names):
+        _, price_in, price_out = prices[tier]
         out.append(ModelSpec(name, provider, tier, price_in if shadow_prices else 0.0,
                              price_out if shadow_prices else 0.0, max_context_tokens=context_tokens,
                              max_output_tokens=max_output_tokens, capabilities=["text"]))
     return out
 
 
+def auto_models(provider: "OllamaProvider", family: str = "qwen") -> List[str]:
+    """The Qwen (or other `family`) models already installed in Ollama, reduced to at most three tags."""
+    try:
+        installed = provider.installed_models()
+    except Exception as exc:
+        raise ConfigError(f"cannot reach Ollama at {provider.host} ({exc}). Is it running? "
+                          f"Start it with `ollama serve`.") from None
+    found = detect_models(installed, family)
+    if not found:
+        raise ConfigError(f"no {family} models found in Ollama (installed: {', '.join(installed) or 'none'}). "
+                          f"Run: ollama pull qwen2.5:3b")
+    return _pick_tiers(found)
+
+
 def gateway_from_ollama(profile: str = "standard", host: Optional[str] = None, preset: str = "general",
-                        models: Optional[Iterable[str]] = None, shadow_prices: bool = False,
+                        models: Union[None, str, Iterable[str]] = None, shadow_prices: bool = False,
                         context_tokens: int = 4096, timeout: float = 300.0, check: bool = False,
                         verify_with: Optional[str] = None, overrides: Optional[Dict[str, Any]] = None,
                         **gateway_kwargs: Any):
     """Build a Gateway whose three tiers are Qwen models served by Ollama.
 
+    `models="auto"` uses the Qwen models Ollama already has (one model is fine: it serves every request).
     `preset` is any industry preset ("customer_support", "healthcare", ...); `overrides` is a config
     dict merged on top (cache, budgets, rules, policy...). With `check=True` it first verifies the
     server is reachable and has the models, and says which `ollama pull` commands to run if not.
@@ -128,6 +166,8 @@ def gateway_from_ollama(profile: str = "standard", host: Optional[str] = None, p
     """
     from ..config import gateway_from_config
     provider = OllamaProvider(host, timeout=timeout)
+    if models == "auto":  # use whatever Qwen models Ollama already has
+        models = auto_models(provider)
     specs = qwen_models(profile, models, context_tokens, shadow_prices=shadow_prices)
     if check:
         try:
